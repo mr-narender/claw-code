@@ -78,6 +78,9 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
+const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
+const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
+const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
@@ -177,7 +180,10 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
-        CliAction::DumpManifests { output_format } => dump_manifests(output_format)?,
+        CliAction::DumpManifests {
+            output_format,
+            manifests_dir,
+        } => dump_manifests(manifests_dir.as_deref(), output_format)?,
         CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
         CliAction::Agents {
             args,
@@ -274,6 +280,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 enum CliAction {
     DumpManifests {
         output_format: CliOutputFormat,
+        manifests_dir: Option<PathBuf>,
     },
     BootstrapPlan {
         output_format: CliOutputFormat,
@@ -623,7 +630,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
-        "dump-manifests" => Ok(CliAction::DumpManifests { output_format }),
+        "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
@@ -776,6 +783,22 @@ fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
         "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
+}
+
+fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
+    let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
+    let looks_like_skill_name = !bare_first_token.is_empty()
+        && !bare_first_token.starts_with('/')
+        && bare_first_token
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    if !looks_like_skill_name {
+        return None;
+    }
+    match resolve_skill_invocation(cwd, Some(trimmed)) {
+        Ok(SkillSlashDispatch::Invoke(prompt)) => Some(prompt),
+        _ => None,
+    }
 }
 
 fn join_optional_args(args: &[String]) -> Option<String> {
@@ -1197,6 +1220,39 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
     })
 }
 
+fn parse_dump_manifests_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut manifests_dir: Option<PathBuf> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--manifests-dir" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| String::from("--manifests-dir requires a path"))?;
+            manifests_dir = Some(PathBuf::from(value));
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--manifests-dir=") {
+            if value.is_empty() {
+                return Err(String::from("--manifests-dir requires a path"));
+            }
+            manifests_dir = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        return Err(format!("unknown dump-manifests option: {arg}"));
+    }
+
+    Ok(CliAction::DumpManifests {
+        output_format,
+        manifests_dir,
+    })
+}
+
 fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
@@ -1424,6 +1480,7 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
         checks: vec![
             check_auth_health(),
             check_config_health(&config_loader, config.as_ref()),
+            check_install_source_health(),
             check_workspace_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_system_health(&cwd, config.as_ref().ok()),
@@ -1711,6 +1768,36 @@ fn check_config_health(
     }
 }
 
+fn check_install_source_health() -> DiagnosticCheck {
+    DiagnosticCheck::new(
+        "Install source",
+        DiagnosticLevel::Ok,
+        format!(
+            "official source of truth is {OFFICIAL_REPO_SLUG}; avoid `{DEPRECATED_INSTALL_COMMAND}`"
+        ),
+    )
+    .with_details(vec![
+        format!("Official repo     {OFFICIAL_REPO_URL}"),
+        "Recommended path  build from this repo or use the upstream binary documented in README.md"
+            .to_string(),
+        format!(
+            "Deprecated crate  `{DEPRECATED_INSTALL_COMMAND}` installs a deprecated stub and does not provide the `claw` binary"
+        )
+            .to_string(),
+    ])
+    .with_data(Map::from_iter([
+        ("official_repo".to_string(), json!(OFFICIAL_REPO_URL)),
+        (
+            "deprecated_install".to_string(),
+            json!(DEPRECATED_INSTALL_COMMAND),
+        ),
+        (
+            "recommended_install".to_string(),
+            json!("build from source or follow the upstream binary instructions in README.md"),
+        ),
+    ]))
+}
+
 fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
     let in_repo = context.project_root.is_some();
     DiagnosticCheck::new(
@@ -1899,32 +1986,58 @@ fn looks_like_slash_command_token(token: &str) -> bool {
         .any(|spec| spec.name == name || spec.aliases.contains(&name))
 }
 
-fn dump_manifests(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+fn dump_manifests(
+    manifests_dir: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    dump_manifests_at_path(&workspace_dir, output_format)
+    dump_manifests_at_path(&workspace_dir, manifests_dir, output_format)
 }
+
+const DUMP_MANIFESTS_OVERRIDE_HINT: &str =
+    "Hint: set CLAUDE_CODE_UPSTREAM=/path/to/upstream or pass `claw dump-manifests --manifests-dir /path/to/upstream`.";
 
 // Internal function for testing that accepts a workspace directory path.
 fn dump_manifests_at_path(
     workspace_dir: &std::path::Path,
+    manifests_dir: Option<&Path>,
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Surface the resolved path in the error so users can diagnose missing
-    // manifest files without guessing what path the binary expected.
-    // ROADMAP #45: this path is only correct when running from the build tree;
-    // a proper fix would ship manifests alongside the binary.
-    let resolved = workspace_dir
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_dir.to_path_buf());
+    let paths = if let Some(dir) = manifests_dir {
+        let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        UpstreamPaths::from_repo_root(resolved)
+    } else {
+        // Surface the resolved path in the error so users can diagnose missing
+        // manifest files without guessing what path the binary expected.
+        let resolved = workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_dir.to_path_buf());
+        UpstreamPaths::from_workspace_dir(&resolved)
+    };
 
-    let paths = UpstreamPaths::from_workspace_dir(&resolved);
-
-    // Pre-check: verify manifest directory exists
-    let manifest_dir = paths.repo_root();
-    if !manifest_dir.exists() {
+    let source_root = paths.repo_root();
+    if !source_root.exists() {
         return Err(format!(
-            "Manifest files (commands.ts, tools.ts) define CLI commands and tools.\n  Expected at: {}\n  Run `claw init` to create them or specify --manifests-dir.",
-            manifest_dir.display()
+            "Manifest source directory does not exist.\n  looked in: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
+            source_root.display(),
+        )
+        .into());
+    }
+
+    let required_paths = [
+        ("src/commands.ts", paths.commands_path()),
+        ("src/tools.ts", paths.tools_path()),
+        ("src/entrypoints/cli.tsx", paths.cli_path()),
+    ];
+    let missing = required_paths
+        .iter()
+        .filter_map(|(label, path)| (!path.is_file()).then_some(*label))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "Manifest source files are missing.\n  repo root: {}\n  missing: {}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
+            source_root.display(),
+            missing.join(", "),
         )
         .into());
     }
@@ -1950,7 +2063,7 @@ fn dump_manifests_at_path(
             Ok(())
         }
         Err(error) => Err(format!(
-            "failed to extract manifests: {error}\n  looked in: {path}",
+            "failed to extract manifests: {error}\n  looked in: {path}\n  {DUMP_MANIFESTS_OVERRIDE_HINT}",
             path = paths.repo_root().display()
         )
         .into()),
@@ -2977,22 +3090,12 @@ fn run_repl(
                 // Bare-word skill dispatch: if the first token of the input
                 // matches a known skill name, invoke it as `/skills <input>`
                 // rather than forwarding raw text to the LLM (ROADMAP #36).
-                let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
-                let looks_like_skill_name = !bare_first_token.is_empty()
-                    && !bare_first_token.starts_with('/')
-                    && bare_first_token
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
-                if looks_like_skill_name {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    if let Ok(SkillSlashDispatch::Invoke(prompt)) =
-                        resolve_skill_invocation(&cwd, Some(&trimmed))
-                    {
-                        editor.push_history(input);
-                        cli.record_prompt_history(&trimmed);
-                        cli.run_turn(&prompt)?;
-                        continue;
-                    }
+                let cwd = std::env::current_dir().unwrap_or_default();
+                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
+                    editor.push_history(input);
+                    cli.record_prompt_history(&trimmed);
+                    cli.run_turn(&prompt)?;
+                    continue;
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
@@ -3019,6 +3122,7 @@ struct SessionHandle {
 struct ManagedSessionSummary {
     id: String,
     path: PathBuf,
+    updated_at_ms: u64,
     modified_epoch_millis: u128,
     message_count: usize,
     parent_session_id: Option<String>,
@@ -4608,6 +4712,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
         .map(|session| ManagedSessionSummary {
             id: session.id,
             path: session.path,
+            updated_at_ms: session.updated_at_ms,
             modified_epoch_millis: session.modified_epoch_millis,
             message_count: session.message_count,
             parent_session_id: session.parent_session_id,
@@ -4623,6 +4728,7 @@ fn latest_managed_session() -> Result<ManagedSessionSummary, Box<dyn std::error:
     Ok(ManagedSessionSummary {
         id: session.id,
         path: session.path,
+        updated_at_ms: session.updated_at_ms,
         modified_epoch_millis: session.modified_epoch_millis,
         message_count: session.message_count,
         parent_session_id: session.parent_session_id,
@@ -8042,7 +8148,12 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
-    writeln!(out, "  claw dump-manifests")?;
+    writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
+    writeln!(
+        out,
+        "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
+    )?;
+    writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
@@ -8131,6 +8242,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
     writeln!(out, "  claw doctor")?;
+    writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
+    writeln!(
+        out,
+        "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
+    )?;
     writeln!(out, "  claw init")?;
     writeln!(out, "  claw export")?;
     writeln!(out, "  claw export conversation.md")?;
@@ -8176,10 +8292,11 @@ mod tests {
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
-        summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8418,6 +8535,16 @@ mod tests {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),
         }
+    }
+
+    fn write_skill_fixture(root: &Path, name: &str, description: &str) {
+        let skill_dir = root.join(name);
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
+        )
+        .expect("skill file should write");
     }
 
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
@@ -9042,6 +9169,33 @@ mod tests {
             CliAction::Agents {
                 args: Some("--help".to_string()),
                 output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
+    fn dump_manifests_subcommand_accepts_explicit_manifest_dir() {
+        assert_eq!(
+            parse_args(&[
+                "dump-manifests".to_string(),
+                "--manifests-dir".to_string(),
+                "/tmp/upstream".to_string(),
+            ])
+            .expect("dump-manifests should parse"),
+            CliAction::DumpManifests {
+                output_format: CliOutputFormat::Text,
+                manifests_dir: Some(PathBuf::from("/tmp/upstream")),
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "dump-manifests".to_string(),
+                "--manifests-dir=/tmp/upstream".to_string()
+            ])
+            .expect("inline dump-manifests flag should parse"),
+            CliAction::DumpManifests {
+                output_format: CliOutputFormat::Text,
+                manifests_dir: Some(PathBuf::from("/tmp/upstream")),
             }
         );
     }
@@ -9714,6 +9868,38 @@ mod tests {
     }
 
     #[test]
+    fn bare_skill_dispatch_resolves_known_project_skill_to_prompt() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        write_skill_fixture(
+            &workspace.join(".codex").join("skills"),
+            "caveman",
+            "Project skill fixture",
+        );
+
+        let prompt = try_resolve_bare_skill_prompt(&workspace, "caveman sharpen club")
+            .expect("known bare skill should dispatch");
+        assert_eq!(prompt, "$caveman sharpen club");
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn bare_skill_dispatch_ignores_unknown_or_non_skill_input() {
+        let _guard = env_lock();
+        let workspace = temp_dir();
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+
+        assert_eq!(
+            try_resolve_bare_skill_prompt(&workspace, "not-a-known-skill do thing"),
+            None
+        );
+        assert_eq!(try_resolve_bare_skill_prompt(&workspace, "/status"), None);
+
+        fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
     fn repl_help_includes_shared_commands_and_exit() {
         let help = render_repl_help();
         assert!(help.contains("REPL"));
@@ -9943,6 +10129,8 @@ mod tests {
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
         assert!(help.contains("claw /skills"));
+        assert!(help.contains("ultraworkers/claw-code"));
+        assert!(help.contains("cargo install claw-code"));
         assert!(!help.contains("claw login"));
         assert!(!help.contains("claw logout"));
     }
@@ -10346,7 +10534,7 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -10385,7 +10573,7 @@ UU conflicted.rs",
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -10418,7 +10606,7 @@ UU conflicted.rs",
 
     #[test]
     fn load_session_reference_rejects_workspace_mismatch() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_guard();
         let workspace_a = temp_workspace("session-mismatch-a");
         let workspace_b = temp_workspace("session-mismatch-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
@@ -10490,6 +10678,24 @@ UU conflicted.rs",
     fn cwd_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn cwd_guard() -> MutexGuard<'static, ()> {
+        cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn cwd_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = cwd_guard();
+            panic!("poison cwd lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = cwd_guard();
     }
 
     fn temp_workspace(label: &str) -> PathBuf {
@@ -11505,43 +11711,78 @@ mod sandbox_report_tests {
 #[cfg(test)]
 mod dump_manifests_tests {
     use super::{dump_manifests_at_path, CliOutputFormat};
+    use std::fs;
 
     #[test]
     fn dump_manifests_shows_helpful_error_when_manifests_missing() {
-        // Create a temp directory without manifest files
-        let temp_dir = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "claw_test_missing_manifests_{}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("failed to create temp workspace");
 
-        // Clean up at the end of the test
-        let _cleanup = std::panic::catch_unwind(|| {
-            // Call dump_manifests_at_path with the temp directory
-            let result = dump_manifests_at_path(&temp_dir, CliOutputFormat::Text);
+        let result = dump_manifests_at_path(&workspace, None, CliOutputFormat::Text);
+        assert!(
+            result.is_err(),
+            "expected an error when manifests are missing"
+        );
 
-            // Assert that the call fails
-            assert!(
-                result.is_err(),
-                "expected an error when manifests are missing"
-            );
+        let error_msg = result.unwrap_err().to_string();
 
-            let error_msg = result.unwrap_err().to_string();
+        assert!(
+            error_msg.contains("Manifest source files are missing"),
+            "error message should mention missing manifest sources: {error_msg}"
+        );
+        assert!(
+            error_msg.contains(&root.display().to_string()),
+            "error message should contain the resolved repo root path: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("src/commands.ts"),
+            "error message should mention missing commands.ts: {error_msg}"
+        );
+        assert!(
+            error_msg.contains("CLAUDE_CODE_UPSTREAM"),
+            "error message should explain how to supply the upstream path: {error_msg}"
+        );
 
-            // Assert the error message contains "Manifest files (commands.ts, tools.ts)"
-            assert!(
-                error_msg.contains("Manifest files (commands.ts, tools.ts)"),
-                "error message should mention manifest files: {error_msg}"
-            );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-            // Assert the error message contains the expected path
-            assert!(
-                error_msg.contains(&temp_dir.display().to_string()),
-                "error message should contain the expected path: {error_msg}"
-            );
-        });
+    #[test]
+    fn dump_manifests_uses_explicit_manifest_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "claw_test_explicit_manifest_dir_{}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let upstream = root.join("upstream");
+        fs::create_dir_all(workspace.join("nested")).expect("workspace should exist");
+        fs::create_dir_all(upstream.join("src/entrypoints"))
+            .expect("upstream fixture should exist");
+        fs::write(
+            upstream.join("src/commands.ts"),
+            "import FooCommand from './commands/foo'\n",
+        )
+        .expect("commands fixture should write");
+        fs::write(
+            upstream.join("src/tools.ts"),
+            "import ReadTool from './tools/read'\n",
+        )
+        .expect("tools fixture should write");
+        fs::write(
+            upstream.join("src/entrypoints/cli.tsx"),
+            "startupProfiler()\n",
+        )
+        .expect("cli fixture should write");
 
-        // Clean up temp directory
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let result = dump_manifests_at_path(&workspace, Some(&upstream), CliOutputFormat::Text);
+        assert!(
+            result.is_ok(),
+            "explicit manifest dir should succeed: {result:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

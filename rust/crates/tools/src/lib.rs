@@ -20,7 +20,7 @@ use runtime::{
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
-    worker_boot::{WorkerReadySnapshot, WorkerRegistry},
+    worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
     BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
@@ -930,7 +930,22 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "worker_id": { "type": "string" },
-                    "prompt": { "type": "string" }
+                    "prompt": { "type": "string" },
+                    "task_receipt": {
+                        "type": "object",
+                        "properties": {
+                            "repo": { "type": "string" },
+                            "task_kind": { "type": "string" },
+                            "source_surface": { "type": "string" },
+                            "expected_artifacts": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "objective_preview": { "type": "string" }
+                        },
+                        "required": ["repo", "task_kind", "source_surface", "objective_preview"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["worker_id"],
                 "additionalProperties": false
@@ -1522,7 +1537,11 @@ fn run_worker_await_ready(input: WorkerIdInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_worker_send_prompt(input: WorkerSendPromptInput) -> Result<String, String> {
-    let worker = global_worker_registry().send_prompt(&input.worker_id, input.prompt.as_deref())?;
+    let worker = global_worker_registry().send_prompt(
+        &input.worker_id,
+        input.prompt.as_deref(),
+        input.task_receipt,
+    )?;
     to_pretty_json(worker)
 }
 
@@ -2439,6 +2458,8 @@ struct WorkerSendPromptInput {
     worker_id: String,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    task_receipt: Option<WorkerTaskReceipt>,
 }
 
 const fn default_auto_recover_prompt_misdelivery() -> bool {
@@ -3743,12 +3764,14 @@ fn persist_agent_terminal_state(
             .push(LaneEvent::failed(iso8601_now(), &blocker));
     } else {
         next_manifest.current_blocker = None;
-        let compressed_detail = result
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| compress_summary_text(value.trim()));
-        next_manifest
-            .lane_events
-            .push(LaneEvent::finished(iso8601_now(), compressed_detail));
+        let mut finished_summary = build_lane_finished_summary(&next_manifest, result);
+        finished_summary.data.disabled_cron_ids = disable_matching_crons(&next_manifest, result);
+        next_manifest.lane_events.push(
+            LaneEvent::finished(iso8601_now(), finished_summary.detail).with_data(
+                serde_json::to_value(&finished_summary.data)
+                    .expect("lane summary metadata should serialize"),
+            ),
+        );
         if let Some(provenance) = maybe_commit_provenance(result) {
             next_manifest.lane_events.push(LaneEvent::commit_created(
                 iso8601_now(),
@@ -3758,6 +3781,467 @@ fn persist_agent_terminal_state(
         }
     }
     write_agent_manifest(&next_manifest)
+}
+
+const MIN_LANE_SUMMARY_WORDS: usize = 7;
+const REVIEW_VERDICTS: &[(&str, &str)] = &[
+    ("APPROVE", "approve"),
+    ("REJECT", "reject"),
+    ("BLOCKED", "blocked"),
+];
+const CONTROL_ONLY_SUMMARY_WORDS: &[&str] = &[
+    "ack",
+    "commit",
+    "continue",
+    "everyting",
+    "everything",
+    "keep",
+    "next",
+    "push",
+    "ralph",
+    "resume",
+    "retry",
+    "run",
+    "stop",
+    "sweep",
+    "sweeping",
+    "team",
+];
+const CONTEXTUAL_SUMMARY_WORDS: &[&str] = &[
+    "added",
+    "audited",
+    "blocked",
+    "completed",
+    "documented",
+    "failed",
+    "finished",
+    "fixed",
+    "implemented",
+    "investigated",
+    "merged",
+    "pushed",
+    "refactored",
+    "removed",
+    "reviewed",
+    "tested",
+    "updated",
+    "verified",
+];
+
+#[derive(Debug, Clone, Serialize)]
+struct LaneFinishedSummaryData {
+    #[serde(rename = "qualityFloorApplied")]
+    quality_floor_applied: bool,
+    reasons: Vec<String>,
+    #[serde(rename = "rawSummary", skip_serializing_if = "Option::is_none")]
+    raw_summary: Option<String>,
+    #[serde(rename = "wordCount")]
+    word_count: usize,
+    #[serde(rename = "reviewVerdict", skip_serializing_if = "Option::is_none")]
+    review_verdict: Option<String>,
+    #[serde(rename = "reviewTarget", skip_serializing_if = "Option::is_none")]
+    review_target: Option<String>,
+    #[serde(rename = "reviewRationale", skip_serializing_if = "Option::is_none")]
+    review_rationale: Option<String>,
+    #[serde(rename = "selectionOutcome", skip_serializing_if = "Option::is_none")]
+    selection_outcome: Option<SelectionOutcome>,
+    #[serde(rename = "artifactProvenance", skip_serializing_if = "Option::is_none")]
+    artifact_provenance: Option<ArtifactProvenance>,
+    #[serde(rename = "disabledCronIds", skip_serializing_if = "Vec::is_empty")]
+    disabled_cron_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LaneFinishedSummary {
+    detail: Option<String>,
+    data: LaneFinishedSummaryData,
+}
+
+#[derive(Debug)]
+struct LaneSummaryAssessment {
+    apply_quality_floor: bool,
+    reasons: Vec<String>,
+    word_count: usize,
+    review_outcome: Option<ReviewLaneOutcome>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewLaneOutcome {
+    verdict: String,
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SelectionOutcome {
+    #[serde(rename = "chosenItems", skip_serializing_if = "Vec::is_empty")]
+    chosen_items: Vec<String>,
+    #[serde(rename = "skippedItems", skip_serializing_if = "Vec::is_empty")]
+    skipped_items: Vec<String>,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArtifactProvenance {
+    #[serde(rename = "sourceLanes", skip_serializing_if = "Vec::is_empty")]
+    source_lanes: Vec<String>,
+    #[serde(rename = "roadmapIds", skip_serializing_if = "Vec::is_empty")]
+    roadmap_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    files: Vec<String>,
+    #[serde(rename = "diffStat", skip_serializing_if = "Option::is_none")]
+    diff_stat: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    verification: Vec<String>,
+    #[serde(rename = "commitSha", skip_serializing_if = "Option::is_none")]
+    commit_sha: Option<String>,
+}
+
+fn build_lane_finished_summary(
+    manifest: &AgentOutput,
+    result: Option<&str>,
+) -> LaneFinishedSummary {
+    let raw_summary = result.map(str::trim).filter(|value| !value.is_empty());
+    let assessment = assess_lane_summary_quality(raw_summary.unwrap_or_default());
+    let detail = match raw_summary {
+        Some(summary) if !assessment.apply_quality_floor => Some(compress_summary_text(summary)),
+        Some(summary) => Some(compose_lane_summary_fallback(manifest, Some(summary))),
+        None => Some(compose_lane_summary_fallback(manifest, None)),
+    };
+    let review_outcome = assessment.review_outcome.clone();
+    let review_target = review_outcome
+        .as_ref()
+        .map(|_| manifest.description.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let artifact_provenance = extract_artifact_provenance(manifest, raw_summary);
+
+    LaneFinishedSummary {
+        detail,
+        data: LaneFinishedSummaryData {
+            quality_floor_applied: raw_summary.is_none() || assessment.apply_quality_floor,
+            reasons: assessment.reasons,
+            raw_summary: raw_summary.map(str::to_string),
+            word_count: assessment.word_count,
+            review_verdict: review_outcome
+                .as_ref()
+                .map(|outcome| outcome.verdict.clone()),
+            review_target,
+            review_rationale: review_outcome.and_then(|outcome| outcome.rationale),
+            selection_outcome: extract_selection_outcome(raw_summary.unwrap_or_default()),
+            artifact_provenance,
+            disabled_cron_ids: Vec::new(),
+        },
+    }
+}
+
+fn assess_lane_summary_quality(summary: &str) -> LaneSummaryAssessment {
+    let words = summary
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '#'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    let word_count = words.len();
+    let mut reasons = Vec::new();
+    if summary.trim().is_empty() {
+        reasons.push(String::from("empty"));
+    }
+
+    let review_outcome = extract_review_outcome(summary);
+
+    let control_only = !words.is_empty()
+        && words
+            .iter()
+            .all(|word| CONTROL_ONLY_SUMMARY_WORDS.contains(&word.as_str()));
+    if control_only && review_outcome.is_none() {
+        reasons.push(String::from("control_only"));
+    }
+
+    let has_context_signal = summary.contains('`')
+        || summary.contains('/')
+        || summary.contains(':')
+        || summary.contains('#')
+        || review_outcome.is_some()
+        || words
+            .iter()
+            .any(|word| CONTEXTUAL_SUMMARY_WORDS.contains(&word.as_str()));
+    if word_count < MIN_LANE_SUMMARY_WORDS && !has_context_signal {
+        reasons.push(String::from("too_short_without_context"));
+    }
+
+    LaneSummaryAssessment {
+        apply_quality_floor: !reasons.is_empty(),
+        reasons,
+        word_count,
+        review_outcome,
+    }
+}
+
+fn compose_lane_summary_fallback(manifest: &AgentOutput, raw_summary: Option<&str>) -> String {
+    let target = manifest.description.trim();
+    let base = format!(
+        "Completed lane `{}` for target: {}. Status: completed.",
+        manifest.name,
+        if target.is_empty() {
+            "unspecified task"
+        } else {
+            target
+        }
+    );
+    match raw_summary {
+        Some(summary) => format!(
+            "{base} Original stop summary was too vague to keep as the lane result: \"{}\".",
+            summary.trim()
+        ),
+        None => format!("{base} No usable stop summary was produced by the lane."),
+    }
+}
+
+fn extract_review_outcome(summary: &str) -> Option<ReviewLaneOutcome> {
+    let mut lines = summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let first = lines.next()?;
+    let verdict = REVIEW_VERDICTS.iter().find_map(|(prefix, verdict)| {
+        first
+            .eq_ignore_ascii_case(prefix)
+            .then(|| (*verdict).to_string())
+    })?;
+    let rationale = lines.collect::<Vec<_>>().join(" ").trim().to_string();
+    Some(ReviewLaneOutcome {
+        verdict,
+        rationale: (!rationale.is_empty()).then_some(compress_summary_text(&rationale)),
+    })
+}
+
+fn extract_selection_outcome(summary: &str) -> Option<SelectionOutcome> {
+    let mut chosen_items = Vec::new();
+    let mut skipped_items = Vec::new();
+    let mut action = None;
+    let mut rationale = None;
+
+    for line in summary
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let lowered = line.to_ascii_lowercase();
+        let roadmap_items = extract_roadmap_items(line);
+
+        if lowered.starts_with("chosen:")
+            || lowered.starts_with("picked:")
+            || lowered.starts_with("selected:")
+            || (lowered.contains("picked") && !roadmap_items.is_empty())
+            || (lowered.contains("selected") && !roadmap_items.is_empty())
+        {
+            chosen_items.extend(roadmap_items);
+        } else if lowered.starts_with("skipped:")
+            || lowered.starts_with("skip:")
+            || (lowered.contains("skipped") && !roadmap_items.is_empty())
+        {
+            skipped_items.extend(roadmap_items);
+        }
+
+        if let Some(rest) = lowered.strip_prefix("action:") {
+            if rest.contains("execute") || rest.contains("implement") || rest.contains("fix") {
+                action = Some(String::from("execute"));
+            } else if rest.contains("review") || rest.contains("audit") {
+                action = Some(String::from("review"));
+            } else if rest.contains("no-op") || rest.contains("noop") {
+                action = Some(String::from("no-op"));
+            }
+        }
+
+        if let Some(rest) = line.strip_prefix("Rationale:") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                rationale = Some(compress_summary_text(trimmed));
+            }
+        }
+    }
+
+    chosen_items.sort();
+    chosen_items.dedup();
+    skipped_items.sort();
+    skipped_items.dedup();
+
+    if chosen_items.is_empty() && skipped_items.is_empty() && action.is_none() {
+        return None;
+    }
+
+    let default_action = if chosen_items.is_empty() {
+        String::from("no-op")
+    } else {
+        String::from("execute")
+    };
+
+    Some(SelectionOutcome {
+        chosen_items,
+        skipped_items,
+        action: action.unwrap_or(default_action),
+        rationale,
+    })
+}
+
+fn extract_roadmap_items(line: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '#' {
+            let mut digits = String::new();
+            while let Some(next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    digits.push(*next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !digits.is_empty() {
+                items.push(format!("ROADMAP #{digits}"));
+            }
+        }
+    }
+    items
+}
+
+fn extract_artifact_provenance(
+    manifest: &AgentOutput,
+    raw_summary: Option<&str>,
+) -> Option<ArtifactProvenance> {
+    let summary = raw_summary?;
+    let mut roadmap_ids = extract_roadmap_items(summary);
+    roadmap_ids.extend(extract_roadmap_items(&manifest.description));
+    roadmap_ids.sort();
+    roadmap_ids.dedup();
+
+    let mut files = extract_file_paths(summary);
+    files.sort();
+    files.dedup();
+
+    let mut verification = Vec::new();
+    let lowered = summary.to_ascii_lowercase();
+    for (needle, label) in [
+        ("tested", "tested"),
+        ("committed", "committed"),
+        ("pushed", "pushed"),
+        ("merged", "merged"),
+    ] {
+        if lowered.contains(needle) {
+            verification.push(label.to_string());
+        }
+    }
+
+    let commit_sha = extract_commit_sha(summary);
+    let diff_stat = extract_diff_stat(summary);
+    let source_lanes = vec![manifest.name.clone()];
+
+    if roadmap_ids.is_empty()
+        && files.is_empty()
+        && verification.is_empty()
+        && commit_sha.is_none()
+        && diff_stat.is_none()
+    {
+        return None;
+    }
+
+    Some(ArtifactProvenance {
+        source_lanes,
+        roadmap_ids,
+        files,
+        diff_stat,
+        verification,
+        commit_sha,
+    })
+}
+
+fn extract_file_paths(summary: &str) -> Vec<String> {
+    summary
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '(' | ')' | '[' | ']'))
+        .map(|token| {
+            token
+                .trim_matches('`')
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim_end_matches('.')
+        })
+        .filter(|token| {
+            token.contains('.')
+                && !token.starts_with("http")
+                && !token
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == '+' || ch == '-')
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn extract_diff_stat(summary: &str) -> Option<String> {
+    summary
+        .split('\n')
+        .map(str::trim)
+        .find_map(|line| {
+            line.find("Diff stat:")
+                .map(|index| normalize_diff_stat(&line[(index + "Diff stat:".len())..]))
+                .or_else(|| {
+                    line.find("Diff:")
+                        .map(|index| normalize_diff_stat(&line[(index + "Diff:".len())..]))
+                })
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_diff_stat(value: &str) -> String {
+    let trimmed = value.trim();
+    for marker in [" Tested", " Committed", " committed", " pushed", " merged"] {
+        if let Some((prefix, _)) = trimmed.split_once(marker) {
+            return prefix.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn disable_matching_crons(manifest: &AgentOutput, result: Option<&str>) -> Vec<String> {
+    let tokens = cron_match_tokens(manifest, result);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut disabled = Vec::new();
+    for entry in global_cron_registry().list(true) {
+        let haystack = format!(
+            "{} {}",
+            entry.prompt,
+            entry.description.as_deref().unwrap_or_default()
+        )
+        .to_ascii_lowercase();
+        if tokens.iter().any(|token| haystack.contains(token))
+            && global_cron_registry().disable(&entry.cron_id).is_ok()
+        {
+            disabled.push(entry.cron_id);
+        }
+    }
+    disabled.sort();
+    disabled
+}
+
+fn cron_match_tokens(manifest: &AgentOutput, result: Option<&str>) -> Vec<String> {
+    let mut tokens = extract_roadmap_items(manifest.description.as_str())
+        .into_iter()
+        .chain(extract_roadmap_items(result.unwrap_or_default()))
+        .map(|item| item.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if tokens.is_empty() && !manifest.name.trim().is_empty() {
+        tokens.push(manifest.name.trim().to_ascii_lowercase());
+    }
+
+    tokens.sort();
+    tokens.dedup();
+    tokens
 }
 
 fn derive_agent_state(
@@ -5545,7 +6029,7 @@ mod tests {
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
         derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
         SubagentToolExecutor,
@@ -5561,6 +6045,24 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn env_guard_recovers_after_poisoning() {
+        let poisoned = std::thread::spawn(|| {
+            let _guard = env_guard();
+            panic!("poison env lock");
+        })
+        .join();
+        assert!(poisoned.is_err(), "poisoning thread should panic");
+
+        let _guard = env_guard();
     }
 
     fn temp_path(name: &str) -> PathBuf {
@@ -6683,7 +7185,7 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let home = temp_path("skills-home");
         let skill_dir = home.join(".agents").join("skills").join("help");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
@@ -6740,7 +7242,7 @@ mod tests {
 
     #[test]
     fn skill_resolves_project_local_skills_and_legacy_commands() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("project-skills");
         let skill_dir = root.join(".claw").join("skills").join("plan");
         let command_dir = root.join(".claw").join("commands");
@@ -6784,7 +7286,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_claude_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("project-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -6835,7 +7337,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_omc_and_agents_skill_prompts() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("project-omc-skills");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -6905,7 +7407,7 @@ mod tests {
 
     #[test]
     fn skill_loads_learned_skill_from_claude_config_dir() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("claude-config-learned-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
@@ -6960,7 +7462,7 @@ mod tests {
 
     #[test]
     fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("claude-config-direct-skill");
         let home = root.join("home");
         let claude_config_dir = root.join("claude-config");
@@ -7032,7 +7534,7 @@ mod tests {
 
     #[test]
     fn skill_loads_project_local_legacy_command_markdown() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_guard();
         let root = temp_path("project-legacy-command");
         let home = root.join("home");
         let workspace = root.join("workspace");
@@ -7241,6 +7743,14 @@ mod tests {
             "lane.finished"
         );
         assert_eq!(
+            completed_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
+            false
+        );
+        assert_eq!(
+            completed_manifest_json["laneEvents"][1]["detail"],
+            "Finished successfully in commit abc1234"
+        );
+        assert_eq!(
             completed_manifest_json["laneEvents"][2]["event"],
             "lane.commit.created"
         );
@@ -7300,6 +7810,239 @@ mod tests {
             "tool_runtime"
         );
         assert_eq!(failed_manifest_json["derivedState"], "truly_idle");
+
+        let normalized = execute_agent_with_spawn(
+            AgentInput {
+                description: "Sweep the next backlog item".to_string(),
+                prompt: "Produce a low-signal stop summary".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("summary-floor".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("commit push everyting, keep sweeping $ralph"),
+                    None,
+                )
+            },
+        )
+        .expect("normalized agent should succeed");
+
+        let normalized_manifest = std::fs::read_to_string(&normalized.manifest_file)
+            .expect("normalized manifest should exist");
+        let normalized_manifest_json: serde_json::Value =
+            serde_json::from_str(&normalized_manifest).expect("normalized manifest json");
+        assert_eq!(
+            normalized_manifest_json["laneEvents"][1]["event"],
+            "lane.finished"
+        );
+        let normalized_detail = normalized_manifest_json["laneEvents"][1]["detail"]
+            .as_str()
+            .expect("normalized detail");
+        assert!(normalized_detail.contains("Completed lane `summary-floor`"));
+        assert!(normalized_detail.contains("Sweep the next backlog item"));
+        assert_eq!(
+            normalized_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
+            true
+        );
+        assert_eq!(
+            normalized_manifest_json["laneEvents"][1]["data"]["rawSummary"],
+            "commit push everyting, keep sweeping $ralph"
+        );
+        assert_eq!(
+            normalized_manifest_json["laneEvents"][1]["data"]["reasons"][0],
+            "control_only"
+        );
+
+        let review = execute_agent_with_spawn(
+            AgentInput {
+                description: "Review commit 1234abcd for ROADMAP #67".to_string(),
+                prompt: "Review the scoped diff".to_string(),
+                subagent_type: Some("Verification".to_string()),
+                name: Some("review-lane".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("APPROVE\n\nTarget: commit 1234abcd\nRationale: scoped diff is safe."),
+                    None,
+                )
+            },
+        )
+        .expect("review agent should succeed");
+
+        let review_manifest =
+            std::fs::read_to_string(&review.manifest_file).expect("review manifest should exist");
+        let review_manifest_json: serde_json::Value =
+            serde_json::from_str(&review_manifest).expect("review manifest json");
+        assert_eq!(
+            review_manifest_json["laneEvents"][1]["data"]["reviewVerdict"],
+            "approve"
+        );
+        assert_eq!(
+            review_manifest_json["laneEvents"][1]["data"]["reviewTarget"],
+            "Review commit 1234abcd for ROADMAP #67"
+        );
+        assert_eq!(
+            review_manifest_json["laneEvents"][1]["data"]["reviewRationale"],
+            "Target: commit 1234abcd Rationale: scoped diff is safe."
+        );
+        assert_eq!(
+            review_manifest_json["laneEvents"][1]["data"]["qualityFloorApplied"],
+            false
+        );
+
+        let selection = execute_agent_with_spawn(
+            AgentInput {
+                description: "Scan ROADMAP Immediate Backlog for the next repo-local item".to_string(),
+                prompt: "Choose the next backlog target".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("backlog-scan".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some(
+                        "Selected next backlog target.\nChosen: ROADMAP #65\nSkipped: ROADMAP #63, ROADMAP #64\nAction: execute\nRationale: #65 is the next repo-local lane-finished metadata task.",
+                    ),
+                    None,
+                )
+            },
+        )
+        .expect("selection agent should succeed");
+
+        let selection_manifest = std::fs::read_to_string(&selection.manifest_file)
+            .expect("selection manifest should exist");
+        let selection_manifest_json: serde_json::Value =
+            serde_json::from_str(&selection_manifest).expect("selection manifest json");
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["chosenItems"][0],
+            "ROADMAP #65"
+        );
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["skippedItems"][0],
+            "ROADMAP #63"
+        );
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["skippedItems"][1],
+            "ROADMAP #64"
+        );
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["action"],
+            "execute"
+        );
+        assert_eq!(
+            selection_manifest_json["laneEvents"][1]["data"]["selectionOutcome"]["rationale"],
+            "#65 is the next repo-local lane-finished metadata task."
+        );
+
+        let artifact = execute_agent_with_spawn(
+            AgentInput {
+                description: "Land ROADMAP #64 provenance hardening".to_string(),
+                prompt: "Ship structured artifact provenance".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("artifact-lane".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some(
+                        "Completed ROADMAP #64. Files: rust/crates/tools/src/lib.rs ROADMAP.md. Diff stat: 2 files, +12/-1. Tested, committed, pushed as commit deadbee.",
+                    ),
+                    None,
+                )
+            },
+        )
+        .expect("artifact agent should succeed");
+
+        let artifact_manifest = std::fs::read_to_string(&artifact.manifest_file)
+            .expect("artifact manifest should exist");
+        let artifact_manifest_json: serde_json::Value =
+            serde_json::from_str(&artifact_manifest).expect("artifact manifest json");
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["sourceLanes"][0],
+            "artifact-lane"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["roadmapIds"][0],
+            "ROADMAP #64"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["files"][0],
+            "ROADMAP.md"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["files"][1],
+            "rust/crates/tools/src/lib.rs"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["diffStat"],
+            "2 files, +12/-1."
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
+                [0],
+            "tested"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
+                [1],
+            "committed"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["verification"]
+                [2],
+            "pushed"
+        );
+        assert_eq!(
+            artifact_manifest_json["laneEvents"][1]["data"]["artifactProvenance"]["commitSha"],
+            "deadbee"
+        );
+
+        let cron = global_cron_registry().create(
+            "*/10 * * * *",
+            "roadmap-nudge-10min for ROADMAP #66",
+            Some("ROADMAP #66 reminder"),
+        );
+        let reminder = execute_agent_with_spawn(
+            AgentInput {
+                description: "Close ROADMAP #66 reminder shutdown".to_string(),
+                prompt: "Finish the cron shutdown fix".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("cron-closeout".to_string()),
+                model: None,
+            },
+            |job| {
+                persist_agent_terminal_state(
+                    &job.manifest,
+                    "completed",
+                    Some("Completed ROADMAP #66 after verification."),
+                    None,
+                )
+            },
+        )
+        .expect("reminder agent should succeed");
+
+        let reminder_manifest = std::fs::read_to_string(&reminder.manifest_file)
+            .expect("reminder manifest should exist");
+        let reminder_manifest_json: serde_json::Value =
+            serde_json::from_str(&reminder_manifest).expect("reminder manifest json");
+        assert_eq!(
+            reminder_manifest_json["laneEvents"][1]["data"]["disabledCronIds"][0],
+            cron.cron_id
+        );
+        let disabled_entry = global_cron_registry()
+            .get(&cron.cron_id)
+            .expect("cron should still exist");
+        assert!(!disabled_entry.enabled);
 
         let spawn_error = execute_agent_with_spawn(
             AgentInput {

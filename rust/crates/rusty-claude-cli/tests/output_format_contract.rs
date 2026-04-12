@@ -174,13 +174,15 @@ fn dump_manifests_and_init_emit_json_when_requested() {
     fs::create_dir_all(&root).expect("temp dir should exist");
 
     let upstream = write_upstream_fixture(&root);
-    let manifests = assert_json_command_with_env(
+    let manifests = assert_json_command(
         &root,
-        &["--output-format", "json", "dump-manifests"],
-        &[(
-            "CLAUDE_CODE_UPSTREAM",
+        &[
+            "--output-format",
+            "json",
+            "dump-manifests",
+            "--manifests-dir",
             upstream.to_str().expect("utf8 upstream"),
-        )],
+        ],
     );
     assert_eq!(manifests["kind"], "dump-manifests");
     assert_eq!(manifests["commands"], 1);
@@ -207,7 +209,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
     assert!(summary["failures"].as_u64().is_some());
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 5);
+    assert_eq!(checks.len(), 6);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -219,7 +221,27 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .collect::<Vec<_>>();
     assert_eq!(
         check_names,
-        vec!["auth", "config", "workspace", "sandbox", "system"]
+        vec![
+            "auth",
+            "config",
+            "install source",
+            "workspace",
+            "sandbox",
+            "system"
+        ]
+    );
+
+    let install_source = checks
+        .iter()
+        .find(|check| check["name"] == "install source")
+        .expect("install source check");
+    assert_eq!(
+        install_source["official_repo"],
+        "https://github.com/ultraworkers/claw-code"
+    );
+    assert_eq!(
+        install_source["deprecated_install"],
+        "cargo install claw-code"
     );
 
     let workspace = checks
