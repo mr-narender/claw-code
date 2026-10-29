@@ -20,7 +20,7 @@ use runtime::{
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file_in_workspace,
+    read_file_in_workspace_with_selector,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
@@ -28,7 +28,7 @@ use runtime::{
     write_file_in_workspace, ApiClient, ApiRequest, AssistantEvent, BashCommandInput,
     BashCommandOutput, BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage,
     ConversationRuntime, GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
-    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole,
+    LaneEventName, LaneEventStatus, LaneFailureClass, McpDegradedReport, MemoryStore, MessageRole,
     PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
     Session, TaskPacket, ToolError, ToolExecutor,
 };
@@ -1168,6 +1168,33 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "MemoryRead",
+            description: "Read a file from the persistent memory store. The memory store lives outside the workspace (under ~/.claw/projects/<workspace-hash>/memory/) and is not subject to the workspace boundary. Use this to read memory entries or the MEMORY.md index.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Relative path within the memory directory (e.g. 'MEMORY.md' or 'user_role.md')." }
+                },
+                "required": ["file_path"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "MemoryWrite",
+            description: "Write a file to the persistent memory store. The memory store lives outside the workspace (under ~/.claw/projects/<workspace-hash>/memory/) and is not subject to the workspace boundary. Use this to create or update memory entries and the MEMORY.md index. Parent directories are created automatically.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": { "type": "string", "description": "Relative path within the memory directory (e.g. 'MEMORY.md' or 'feedback_style.md')." },
+                    "content": { "type": "string", "description": "Full file content to write." }
+                },
+                "required": ["file_path", "content"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "LSP",
             description: "Query Language Server Protocol for code intelligence (symbols, references, diagnostics).",
             input_schema: json!({
@@ -1479,6 +1506,8 @@ fn execute_tool_with_enforcer(
         "CronCreate" => from_value::<CronCreateInput>(input).and_then(run_cron_create),
         "CronDelete" => from_value::<CronDeleteInput>(input).and_then(run_cron_delete),
         "CronList" => run_cron_list(input.clone()),
+        "MemoryRead" => from_value::<MemoryReadInput>(input).and_then(run_memory_read),
+        "MemoryWrite" => from_value::<MemoryWriteInput>(input).and_then(run_memory_write),
         "LSP" => from_value::<LspInput>(input).and_then(run_lsp),
         "ListMcpResources" => {
             from_value::<McpResourceInput>(input).and_then(run_list_mcp_resources)
@@ -1846,6 +1875,96 @@ fn run_cron_list(_input: Value) -> Result<String, String> {
         "crons": entries,
         "count": entries.len()
     }))
+}
+
+const MEMORY_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_memory_read(input: MemoryReadInput) -> Result<String, String> {
+    let store = memory_store_for_cwd()?;
+    let target = resolve_memory_path(&store, &input.file_path)?;
+    reject_symlink(&target)?;
+    let meta = std::fs::metadata(&target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("memory file not found: {}", target.display())
+        } else {
+            format!("failed to read memory file: {e}")
+        }
+    })?;
+    if meta.len() > MEMORY_MAX_FILE_BYTES {
+        return Err(format!(
+            "memory file too large ({} bytes, max {MEMORY_MAX_FILE_BYTES})",
+            meta.len(),
+        ));
+    }
+    let content =
+        std::fs::read_to_string(&target).map_err(|e| format!("failed to read memory file: {e}"))?;
+    to_pretty_json(json!({
+        "file_path": target.display().to_string(),
+        "content": content
+    }))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_memory_write(input: MemoryWriteInput) -> Result<String, String> {
+    if input.content.len() as u64 > MEMORY_MAX_FILE_BYTES {
+        return Err(format!(
+            "content too large ({} bytes, max {MEMORY_MAX_FILE_BYTES})",
+            input.content.len(),
+        ));
+    }
+    let store = memory_store_for_cwd()?;
+    let target = resolve_memory_path(&store, &input.file_path)?;
+    store
+        .ensure_dir()
+        .map_err(|e| format!("failed to create memory directory: {e}"))?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create parent directory: {e}"))?;
+    }
+    if target.exists() {
+        reject_symlink(&target)?;
+    }
+    let kind = if target.exists() { "update" } else { "create" };
+    std::fs::write(&target, &input.content)
+        .map_err(|e| format!("failed to write memory file: {e}"))?;
+    to_pretty_json(json!({
+        "type": kind,
+        "file_path": target.display().to_string(),
+        "memory_dir": store.memory_dir().display().to_string()
+    }))
+}
+
+fn reject_symlink(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(format!("refusing to follow symlink: {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn memory_store_for_cwd() -> Result<MemoryStore, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    Ok(MemoryStore::for_workspace(&cwd))
+}
+
+fn resolve_memory_path(store: &MemoryStore, relative: &str) -> Result<PathBuf, String> {
+    let relative = relative.trim();
+    if relative.is_empty() {
+        return Err("file_path must not be empty".to_string());
+    }
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return Err("file_path must be relative to the memory directory, not absolute".to_string());
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err("file_path must not contain '..' components".to_string());
+    }
+    Ok(store.memory_dir().join(path))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2450,8 +2569,14 @@ fn branch_divergence_output(
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
     let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
-        read_file_in_workspace(&input.path, input.offset, input.limit, &workspace)
-            .map_err(io_to_string)?,
+        read_file_in_workspace_with_selector(
+            &input.path,
+            input.offset,
+            input.limit,
+            input.selector.as_deref(),
+            &workspace,
+        )
+        .map_err(io_to_string)?,
     )
 }
 
@@ -2766,6 +2891,7 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    selector: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3014,6 +3140,17 @@ struct CronCreateInput {
 #[derive(Debug, Deserialize)]
 struct CronDeleteInput {
     cron_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryReadInput {
+    file_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryWriteInput {
+    file_path: String,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3391,16 +3528,26 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     let client = build_http_client()?;
     let search_url = build_search_url(&input.query)?;
     let response = client
-        .get(search_url)
+        .get(search_url.as_str())
         .send()
         .map_err(|error| error.to_string())?;
+
+    // DuckDuckGo answers its bot challenge with HTTP 202 and a page without
+    // results, so anything but 200 is an unusable results page.
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(format!(
+            "Web search unavailable (HTTP {}) - the search provider is blocked or unreachable",
+            status.as_u16()
+        ));
+    }
 
     let final_url = response.url().clone();
     let html = response.text().map_err(|error| error.to_string())?;
     let mut hits = extract_search_hits(&html);
 
     if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
+        hits = extract_search_hits_from_generic_links(&html, search_url.host_str());
     }
 
     if let Some(allowed) = input.allowed_domains.as_ref() {
@@ -3623,7 +3770,7 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
     hits
 }
 
-fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
+fn extract_search_hits_from_generic_links(html: &str, search_host: Option<&str>) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     let mut remaining = html;
 
@@ -3654,6 +3801,11 @@ fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
         }
         let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
         if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
+            if is_search_engine_link(&decoded_url, search_host) {
+                remaining = &after_tag[end_anchor_idx + 4..];
+                continue;
+            }
+
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
@@ -3734,6 +3886,20 @@ fn normalize_domain_filter(domain: &str) -> String {
         .trim_start_matches('.')
         .trim_end_matches('/')
         .to_ascii_lowercase()
+}
+
+/// A generic-fallback link that points back at DuckDuckGo or at the configured
+/// search host is page chrome (home, settings, challenge), never a result.
+fn is_search_engine_link(url: &str, search_host: Option<&str>) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    host == "duckduckgo.com"
+        || host.ends_with(".duckduckgo.com")
+        || search_host.is_some_and(|search_host| host.eq_ignore_ascii_case(search_host))
 }
 
 fn dedupe_hits(hits: &mut Vec<SearchHit>) {
@@ -4237,6 +4403,7 @@ fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<Str
         DEFAULT_AGENT_SYSTEM_DATE.to_string(),
         std::env::consts::OS,
         "unknown",
+        model,
         model_family_identity_for(model),
     )
     .map_err(|error| error.to_string())?;
@@ -5388,52 +5555,97 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     messages
         .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
-            };
-            let content = message
-                .blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => InputContentBlock::Thinking {
-                        thinking: thinking.clone(),
-                        signature: signature.clone(),
-                    },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .filter(
-                    |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
-                )
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
+        .filter_map(convert_message)
+        .fold(Vec::new(), absorb_tool_result_message)
+}
+
+/// Converts one conversation message into its wire form.
+fn convert_message(message: &ConversationMessage) -> Option<InputMessage> {
+    let role = match message.role {
+        MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
+        MessageRole::Assistant => "assistant",
+    };
+    let content = message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => InputContentBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            },
+            ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                id: id.clone(),
+                name: name.clone(),
+                input: serde_json::from_str(input)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => InputContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: vec![ToolResultContentBlock::Text {
+                    text: output.clone(),
+                }],
+                is_error: *is_error,
+            },
         })
-        .collect()
+        .filter(|block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()))
+        .collect::<Vec<_>>();
+    (!content.is_empty()).then(|| InputMessage {
+        role: role.to_string(),
+        content,
+    })
+}
+
+/// Identical in `rusty-claude-cli` and `tools`; kept in both copies by review
+/// decision rather than shared, but they must still be changed together.
+///
+/// The two `convert_messages` call sites are not interchangeable: `tools` drops
+/// empty `Text` blocks and the CLI keeps them. That difference is confined to
+/// `convert_message`, so it constrains hoisting the whole conversion, not this
+/// fold. It is reachable when history is not built from the model stream — an
+/// empty `user_text("")` or a persisted `"text":""` restored from a session log
+/// bypasses the `flush_text_block` filter that the streaming path applies.
+/// Appends a message, merging a run of pure tool-result messages into one.
+///
+/// `runtime` records one `MessageRole::Tool` message per tool call, but the
+/// Anthropic Messages API requires every `tool_use` of an assistant turn to be
+/// answered by `tool_result` blocks in the single message that follows it, so a
+/// parallel tool-call turn must not reach the provider as one message per
+/// result. A merge requires both the accumulated message and the incoming one to
+/// be pure tool results: checking only the accumulated side would fold the
+/// assistant reply that follows a tool result into the tool-result message and
+/// lose its role.
+fn absorb_tool_result_message(
+    mut messages: Vec<InputMessage>,
+    message: InputMessage,
+) -> Vec<InputMessage> {
+    if is_tool_result_only(&message) {
+        if let Some(previous) = messages.last_mut() {
+            if previous.role == "user" && is_tool_result_only(previous) {
+                previous.content.extend(message.content);
+                return messages;
+            }
+        }
+    }
+    messages.push(message);
+    messages
+}
+
+/// Reports whether a wire message carries tool results and nothing else.
+fn is_tool_result_only(message: &InputMessage) -> bool {
+    !message.content.is_empty()
+        && message
+            .content
+            .iter()
+            .all(|block| matches!(block, InputContentBlock::ToolResult { .. }))
 }
 
 fn push_output_block(
@@ -6839,19 +7051,20 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        absorb_tool_result_message, agent_permission_policy, allowed_tools_for_subagent,
+        build_agent_system_prompt, classify_lane_failure, convert_message, derive_agent_state,
+        execute_agent_with_spawn, execute_tool, extract_recovery_outcome, final_assistant_text,
+        global_cron_registry, maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
         GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
         SubagentToolExecutor,
     };
-    use api::OutputContentBlock;
+    use api::{InputContentBlock, InputMessage, OutputContentBlock};
     use runtime::ProviderFallbackConfig;
     use runtime::{
-        permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
-        PermissionMode, PermissionPolicy, RuntimeError, Session, TaskPacket, ToolExecutor,
+        permission_enforcer::PermissionEnforcer, ApiClient, ApiRequest, AssistantEvent,
+        ContentBlock, ConversationMessage, ConversationRuntime, PermissionMode, PermissionPolicy,
+        RuntimeError, Session, TaskPacket, ToolExecutor,
     };
     use serde_json::json;
 
@@ -8087,6 +8300,112 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["title"], "Tokio Docs");
         assert_eq!(content[0]["url"], "https://docs.rs/tokio");
+    }
+
+    #[test]
+    fn web_search_returns_error_on_non_2xx_response() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=test"));
+            // Simulate rate-limited/blocked response (HTTP 429)
+            HttpResponse::html(
+                429,
+                "Too Many Requests",
+                "<html><body>\n                  <p>Too many requests. Please try again later.</p>\n                </body></html>",
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "test" }))
+            .expect_err("non-2xx response should fail");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(error.contains("Web search unavailable"));
+        assert!(error.contains("429"));
+    }
+
+    #[test]
+    fn web_search_rejects_duckduckgo_202_challenge_page() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /html/?q=challenge "));
+            HttpResponse::html(
+                202,
+                "Accepted",
+                r#"
+                <html><body>
+                  <a href="/html/">DuckDuckGo</a>
+                  <a href="https://duckduckgo.com/">Home</a>
+                  <p>Unfortunately, bots use DuckDuckGo too.</p>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "challenge" }))
+            .expect_err("a 202 challenge page must not produce results");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(
+            error.contains("Web search unavailable (HTTP 202)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn web_search_generic_fallback_drops_search_engine_links() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=chrome+links "));
+            HttpResponse::html(
+                200,
+                "OK",
+                r#"
+                <html><body>
+                  <a href="/html/">DuckDuckGo</a>
+                  <a href="https://html.duckduckgo.com/html/?q=x">Next page</a>
+                  <a href="https://duckduckgo.com/settings">Settings</a>
+                  <a href="https://docs.rs/serde">Serde Docs</a>
+                  <a href="https://tokio.rs/">Tokio</a>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let result = execute_tool("WebSearch", &json!({ "query": "chrome links" }))
+            .expect("WebSearch fallback parsing should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let content = output["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .find_map(|item| item.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .expect("search result block present");
+        let urls: Vec<&str> = content
+            .iter()
+            .map(|hit| hit["url"].as_str().expect("url"))
+            .collect();
+        assert_eq!(urls, ["https://docs.rs/serde", "https://tokio.rs/"]);
     }
 
     #[test]
@@ -9370,7 +9689,8 @@ mod tests {
 
         // then: the prompt renders a generic model family identity
         assert!(prompt.contains("Model family: an AI assistant"));
-        assert!(!prompt.contains("Model family: Claude Opus 4.6"));
+        assert!(!prompt.contains("Model family: Claude"));
+        assert!(prompt.contains("Model: openai/gpt-4.1-mini"));
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
@@ -10561,6 +10881,43 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
+    fn given_read_only_enforcer_when_read_file_with_selector_then_succeeds() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("perm-read-selector");
+        fs::create_dir_all(&root).expect("create root");
+        let file = root.join("multi-line.txt");
+        fs::write(&file, "line1\nline2\nline3\nline4\nline5\n").expect("write test file");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let registry = read_only_registry();
+        let result = registry.execute(
+            "read_file",
+            &json!({
+                "path": file.display().to_string(),
+                "selector": "2-4"
+            }),
+        );
+        assert!(
+            result.is_ok(),
+            "read_file with selector should succeed: {result:?}"
+        );
+
+        // Verify the output contains the expected lines
+        let output: serde_json::Value =
+            serde_json::from_str(&result.unwrap()).expect("json output");
+        let content = output["file"]["content"].as_str().expect("content field");
+        assert!(content.contains("line2"));
+        assert!(content.contains("line3"));
+        assert!(content.contains("line4"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn given_read_only_enforcer_when_glob_search_then_not_permission_denied() {
         let registry = read_only_registry();
         let result = registry.execute("glob_search", &json!({ "pattern": "*.rs" }));
@@ -10888,5 +11245,196 @@ printf 'pwsh:%s' "$1"
             )
             .into_bytes()
         }
+    }
+    fn tool_result_message(id: &str) -> runtime::ConversationMessage {
+        ConversationMessage::tool_result(id, "bash", "ok", false)
+    }
+
+    #[test]
+    fn subagent_parallel_tool_results_share_one_message() {
+        let messages = vec![
+            ConversationMessage::user_text("go"),
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "{\"command\":\"pwd\"}".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-2".to_string(),
+                    name: "bash".to_string(),
+                    input: "{\"command\":\"ls\"}".to_string(),
+                },
+            ]),
+            tool_result_message("tool-1"),
+            tool_result_message("tool-2"),
+        ];
+
+        let converted = super::convert_messages(&messages);
+
+        assert_eq!(converted.len(), 3, "converted: {converted:?}");
+        let answered = converted[2]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                InputContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(answered, vec!["tool-1", "tool-2"]);
+    }
+
+    #[test]
+    fn subagent_merge_requires_both_sides_to_be_tool_results() {
+        let merged = absorb_tool_result_message(
+            vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![InputContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    content: vec![api::ToolResultContentBlock::Text {
+                        text: "ok".to_string(),
+                    }],
+                    is_error: false,
+                }],
+            }],
+            convert_message(&ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }]))
+            .expect("assistant reply converts"),
+        );
+
+        assert_eq!(
+            merged.len(),
+            2,
+            "the reply after a tool result must stay its own message: {merged:?}"
+        );
+        assert_eq!(merged[1].role, "assistant");
+    }
+
+    #[test]
+    fn subagent_wire_request_pairs_parallel_tool_results() {
+        // The subagent path reaches `convert_messages` only through
+        // `ProviderRuntimeClient::stream`, and that conversion is private, so the
+        // contract has to be checked on the bytes that leave the process: drive the
+        // client against the mock service and assert on the captured body.
+        let _lock = env_guard();
+        // The service must keep serving while this thread blocks inside
+        // `stream()`, so its runtime needs worker threads rather than
+        // `new_current_thread`.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("mock runtime");
+        let server = runtime
+            .block_on(mock_anthropic_service::MockAnthropicService::spawn())
+            .expect("mock service should start");
+
+        // Point the client at the mock: the base URL and both credential variables
+        // are read from the process environment, and this developer shell sets
+        // ANTHROPIC_BASE_URL, so restore whatever was there before.
+        let original_key = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_token = std::env::var_os("ANTHROPIC_AUTH_TOKEN");
+        let original_base = std::env::var_os("ANTHROPIC_BASE_URL");
+        std::env::set_var("ANTHROPIC_API_KEY", "tools-wire-test-key");
+        std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+        std::env::set_var("ANTHROPIC_BASE_URL", server.base_url());
+        let restore = || {
+            for (key, value) in [
+                ("ANTHROPIC_API_KEY", original_key.clone()),
+                ("ANTHROPIC_AUTH_TOKEN", original_token.clone()),
+                ("ANTHROPIC_BASE_URL", original_base.clone()),
+            ] {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        };
+
+        // A turn whose two tool calls already have results: this is exactly the
+        // history `convert_messages` used to split into two wire messages.
+        let messages = vec![
+            ConversationMessage::user_text(format!(
+                "{}multi_tool_turn_roundtrip",
+                mock_anthropic_service::SCENARIO_PREFIX
+            )),
+            ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "toolu_multi_read".to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"fixture.txt"}"#.to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_multi_grep".to_string(),
+                    name: "grep_search".to_string(),
+                    input: r#"{"pattern":"parity","path":"fixture.txt"}"#.to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result(
+                "toolu_multi_read",
+                "read_file",
+                "alpha parity",
+                false,
+            ),
+            ConversationMessage::tool_result("toolu_multi_grep", "grep_search", "2", false),
+        ];
+
+        let mut client = ProviderRuntimeClient::new_with_fallback_config(
+            "sonnet".to_string(),
+            BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
+            &ProviderFallbackConfig::default(),
+        )
+        .expect("provider client");
+        let _ = client.stream(ApiRequest {
+            system_prompt: Vec::new(),
+            messages,
+        });
+
+        let captured = runtime.block_on(server.captured_requests());
+        restore();
+        drop(runtime);
+        let captured = captured
+            .iter()
+            .filter(|request| request.path == "/v1/messages")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured.len(),
+            1,
+            "one message request should leave the client"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&captured[0].raw_body).expect("request body is json");
+        let wire = body["messages"].as_array().expect("messages array");
+
+        // The two tool results must share one user message: pairing requires every
+        // tool_use of an assistant turn to be answered in the message right after it.
+        let result_messages = wire
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+            })
+            .count();
+        assert_eq!(result_messages, 1, "wire body: {body}");
+        let call_messages = wire
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_use"))
+            })
+            .count();
+        assert_eq!(call_messages, 1, "wire body: {body}");
+
+        let answered = wire
+            .iter()
+            .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+            .filter(|block| block["type"] == "tool_result")
+            .filter_map(|block| block["tool_use_id"].as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(answered, vec!["toolu_multi_read", "toolu_multi_grep"]);
     }
 }
