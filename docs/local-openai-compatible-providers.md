@@ -170,24 +170,24 @@ curl -sS "https://llmtr.com/v1/models" \
   | jq -r '.data[] | "\(.id)\t\(.top_provider.max_completion_tokens)"'
 ```
 
-## UberLLM
+## MartLLM
 
-[UberLLM](https://uberllm.dev) is a pay-as-you-go OpenAI-compatible gateway (prepaid, no free tier). Set `OPENAI_BASE_URL` to `https://api.uberllm.dev/v1` and `OPENAI_API_KEY` to a bearer key (`ull_...`).
+[MartLLM](https://martllm.com) is a pay-as-you-go OpenAI-compatible gateway (prepaid, no free tier). Set `OPENAI_BASE_URL` to `https://api.martllm.com/v1` and `OPENAI_API_KEY` to a bearer key (`ull_...`).
 
 ```bash
-export OPENAI_BASE_URL="https://api.uberllm.dev/v1"
+export OPENAI_BASE_URL="https://api.martllm.com/v1"
 export OPENAI_API_KEY="ull_..."
 claw --model "local/deepseek/deepseek-v4-flash" prompt "Reply exactly HELLO_WORLD_123"
 ```
 
-UberLLM ids are vendor-prefixed (`deepseek/deepseek-v4-flash`, `moonshotai/kimi-k2.6`, `qwen/qwen3.8-flash`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Some prefixes would otherwise pick a native route; a bare `qwen/qwen3.8-flash`, for example, goes to DashScope and asks for `DASHSCOPE_API_KEY`.
+MartLLM ids are vendor-prefixed (`deepseek/deepseek-v4-flash`, `moonshotai/kimi-k2.6`, `qwen/qwen3.8-flash`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Some prefixes would otherwise pick a native route; a bare `qwen/qwen3.8-flash`, for example, goes to DashScope and asks for `DASHSCOPE_API_KEY`.
 
-Claw asks for up to 64,000 output tokens on these routes. UberLLM does not reject that on a model with a smaller output limit (for example `aion-labs/aion-3-0-mini`, 32,768); the answer is simply bounded by the model's limit, listed as `max_output_tokens` in the catalog below.
+Claw asks for up to 64,000 output tokens on these routes. MartLLM does not reject that on a model with a smaller output limit (for example `aion-labs/aion-3-0-mini`, 32,768); the answer is simply bounded by the model's limit, listed as `max_output_tokens` in the catalog below.
 
 The public model list does not need a key:
 
 ```bash
-curl -sS "https://api.uberllm.dev/v1/models" \
+curl -sS "https://api.martllm.com/v1/models" \
   | jq -r '.data[] | "\(.id)\t\(.max_output_tokens)"'
 ```
 
@@ -353,6 +353,30 @@ curl -sS "https://api.teamorouter.com/v1/models/pricing" \
 ```
 
 See the [TeamoRouter docs](https://teamorouter.com/docs) for keys and account setup.
+
+## TrustedRouter
+
+[TrustedRouter](https://trustedrouter.com) is an OpenAI-compatible gateway that routes to Anthropic, OpenAI, Google, DeepSeek and other providers behind one key. Set `OPENAI_BASE_URL` to `https://api.trustedrouter.com/v1` and `OPENAI_API_KEY` to your TrustedRouter key.
+
+```bash
+export TRUSTEDROUTER_API_KEY="your-trustedrouter-api-key"
+export OPENAI_BASE_URL="https://api.trustedrouter.com/v1"
+export OPENAI_API_KEY="$TRUSTEDROUTER_API_KEY"
+claw --model "local/deepseek/deepseek-v4-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+TrustedRouter ids are vendor-prefixed (`deepseek/deepseek-v4-flash`, `anthropic/claude-sonnet-4.5`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Without it, an `anthropic/` id picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`. The routed model `trustedrouter/auto`, which picks a model per request, takes the same hatch: `--model "local/trustedrouter/auto"`.
+
+Claw asks for up to 64,000 output tokens on these routes, so pick a model whose output limit is at least that. `deepseek/deepseek-v4-flash` allows 393,216. Each model's limit is listed as `top_provider.max_completion_tokens` in the catalog below.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://api.trustedrouter.com/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.context_length)\t\(.top_provider.max_completion_tokens)"'
+```
+
+See the [TrustedRouter docs](https://trustedrouter.com/docs) for keys and account setup.
 
 ## Local skills install from disk
 
