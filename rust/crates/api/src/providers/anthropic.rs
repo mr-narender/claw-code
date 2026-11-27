@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
+use crate::extra_headers::{ExtraHeadersContext, ExtraHeadersHook};
 use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
@@ -121,6 +122,7 @@ pub struct AnthropicClient {
     request_profile: AnthropicRequestProfile,
     session_tracer: Option<SessionTracer>,
     prompt_cache: Option<PromptCache>,
+    extra_headers: Option<ExtraHeadersHook>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
@@ -137,6 +139,7 @@ impl AnthropicClient {
             request_profile: AnthropicRequestProfile::default(),
             session_tracer: None,
             prompt_cache: None,
+            extra_headers: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
         }
     }
@@ -153,6 +156,7 @@ impl AnthropicClient {
             request_profile: AnthropicRequestProfile::default(),
             session_tracer: None,
             prompt_cache: None,
+            extra_headers: None,
             last_prompt_cache_record: Arc::new(Mutex::new(None)),
         }
     }
@@ -251,6 +255,16 @@ impl AnthropicClient {
     #[must_use]
     pub fn with_prompt_cache(mut self, prompt_cache: PromptCache) -> Self {
         self.prompt_cache = Some(prompt_cache);
+        self
+    }
+
+    /// Install a provider that may add outbound headers to each model request.
+    ///
+    /// The provider sees the final JSON body and can only add headers. Only
+    /// real model requests reach it: `count_tokens` does not.
+    #[must_use]
+    pub fn with_extra_headers_provider(mut self, provider: ExtraHeadersHook) -> Self {
+        self.extra_headers = Some(provider);
         self
     }
 
@@ -488,7 +502,17 @@ impl AnthropicClient {
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let request_body = render_standard_messages_body(&self.request_profile, request)?;
-        let request_builder = self.build_request(&request_url).json(&request_body);
+        let mut request_builder = self.build_request(&request_url).json(&request_body);
+        if let Some(extra_headers) = &self.extra_headers {
+            request_builder = extra_headers.apply(
+                request_builder,
+                &ExtraHeadersContext {
+                    provider: "Anthropic",
+                    model: &request.model,
+                    body: &request_body,
+                },
+            );
+        }
         request_builder.send().await.map_err(ApiError::from)
     }
 
@@ -886,11 +910,11 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     }
 
     let headers = response.headers().clone();
-    let request_id = request_id_from_headers(&headers);
+    let request_id = request_id_from_headers(&headers).map(String::into_boxed_str);
     let body = response.text().await.unwrap_or_else(|_| String::new());
     let parsed_error = serde_json::from_str::<AnthropicErrorEnvelope>(&body).ok();
-    let retryable = is_retryable_status(status);
-    let retry_after = parse_retry_after(&headers, status);
+    let retryable = is_retryable_status(status) || is_retryable_400(status, &body);
+    let retry_after = parse_retry_after(&headers, status).map(Box::new);
 
     Err(ApiError::Api {
         status,
@@ -923,7 +947,10 @@ fn parse_retry_after(
 }
 
 const fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 408 | 409 | 429 | 500 | 502 | 503 | 504)
+    matches!(
+        status.as_u16(),
+        408 | 409 | 429 | 500 | 502 | 503 | 504 | 529
+    )
 }
 
 /// Some providers return HTTP 400 with an unparseable body when a gateway
@@ -1083,9 +1110,9 @@ struct AnthropicErrorBody {
 #[cfg(test)]
 mod tests {
     use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use crate::test_env_lock as env_lock;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1095,14 +1122,8 @@ mod tests {
         now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
         resolve_startup_auth_source, AnthropicClient, AuthSource, OAuthTokenSet,
     };
-    use crate::types::{ContentBlockDelta, MessageRequest};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    use crate::extra_headers::ExtraHeadersHook;
+    use crate::types::{ContentBlockDelta, InputMessage, MessageRequest};
 
     fn temp_config_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1153,6 +1174,56 @@ mod tests {
         format!("http://{address}/oauth/token")
     }
 
+    fn spawn_status_server(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let response = format!(
+                "HTTP/1.1 {status} STATUS\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        format!("http://{address}/v1/messages")
+    }
+
+    #[tokio::test]
+    async fn expect_success_marks_529_overloaded_retryable() {
+        let url = spawn_status_server(
+            529,
+            r#"{"error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+        );
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("529 should error");
+        assert!(error.is_retryable(), "529 overloaded must be retryable");
+    }
+
+    #[tokio::test]
+    async fn expect_success_marks_gateway_flake_400_retryable() {
+        let url = spawn_status_server(400, "HTTP 400 from backend (no parseable body)");
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("400 should error");
+        assert!(
+            error.is_retryable(),
+            "gateway-flake 400 body must be retryable"
+        );
+        let url = spawn_status_server(400, "invalid request: max_tokens must be positive");
+        let response = reqwest::get(&url).await.expect("response");
+        let error = super::expect_success(response)
+            .await
+            .expect_err("400 should error");
+        assert!(!error.is_retryable(), "a real 400 must not be retried");
+    }
     #[test]
     fn read_api_key_requires_presence() {
         let _guard = env_lock();
@@ -1452,6 +1523,40 @@ mod tests {
         assert!(!super::is_retryable_status(
             reqwest::StatusCode::UNAUTHORIZED
         ));
+        // Anthropic returns the non-standard 529 when the API is overloaded;
+        // it is transient and must be retried like a 503.
+        assert!(super::is_retryable_status(
+            reqwest::StatusCode::from_u16(529).expect("529 is a valid status")
+        ));
+        assert!(!super::is_retryable_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
+    fn gateway_flake_400_bodies_are_retryable() {
+        // Gateways and proxies surface transient network failures as HTTP 400
+        // with an unparseable body; is_retryable_400 detects them so
+        // expect_success marks the resulting error retryable.
+        for body in [
+            "HTTP 400 from backend (no parseable body)",
+            "upstream connection reset by peer",
+            "Broken pipe while reading response",
+            "Empty reply from server",
+        ] {
+            assert!(
+                super::is_retryable_400(reqwest::StatusCode::BAD_REQUEST, body),
+                "body should be retryable: {body}"
+            );
+        }
+        assert!(!super::is_retryable_400(
+            reqwest::StatusCode::BAD_REQUEST,
+            "invalid request: max_tokens must be positive"
+        ));
+        assert!(!super::is_retryable_400(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "connection reset"
+        ));
     }
 
     #[test]
@@ -1651,7 +1756,7 @@ mod tests {
             status: reqwest::StatusCode::UNAUTHORIZED,
             error_type: Some("authentication_error".to_string()),
             message: Some("Invalid bearer token".to_string()),
-            request_id: Some("req_varleg_001".to_string()),
+            request_id: Some("req_varleg_001".into()),
             body: String::new(),
             retryable: false,
             suggested_action: None,
@@ -1810,5 +1915,59 @@ mod tests {
             enriched,
             crate::error::ApiError::InvalidSseFrame(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn extra_headers_provider_annotates_the_wire_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 8192];
+            let read = stream.read(&mut buffer).expect("read request");
+            request_tx
+                .send(String::from_utf8_lossy(&buffer[..read]).into_owned())
+                .expect("send request");
+            let body = r#"{"id":"msg_test","type":"message","role":"assistant","model":"claude-sonnet-4","content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let client = AnthropicClient::new("test-key")
+            .with_base_url(format!("http://{address}"))
+            .with_extra_headers_provider(ExtraHeadersHook::new(
+                |ctx: &crate::extra_headers::ExtraHeadersContext<'_>| {
+                    vec![(
+                        "x-route".to_string(),
+                        format!("{}/{}", ctx.provider, ctx.model),
+                    )]
+                },
+            ));
+        let request = MessageRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 16,
+            messages: vec![InputMessage::user_text("hello")],
+            ..Default::default()
+        };
+
+        let response = client.send_raw_request(&request).await.expect("response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let captured = request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("captured request");
+        assert!(
+            captured
+                .to_lowercase()
+                .contains("x-route: anthropic/claude-sonnet-4"),
+            "wire request must carry the provider header: {captured}"
+        );
     }
 }

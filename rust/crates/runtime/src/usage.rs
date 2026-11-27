@@ -1,9 +1,9 @@
 use crate::session::Session;
 
-const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;
-const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;
-const DEFAULT_CACHE_CREATION_COST_PER_MILLION: f64 = 18.75;
-const DEFAULT_CACHE_READ_COST_PER_MILLION: f64 = 1.5;
+const DEFAULT_INPUT_COST_PER_MILLION: f64 = 3.0;
+const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 15.0;
+const DEFAULT_CACHE_CREATION_COST_PER_MILLION: f64 = 3.75;
+const DEFAULT_CACHE_READ_COST_PER_MILLION: f64 = 0.3;
 
 /// Per-million-token pricing used for cost estimation.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,11 +17,24 @@ pub struct ModelPricing {
 impl ModelPricing {
     #[must_use]
     pub const fn default_sonnet_tier() -> Self {
+        Self::per_million(
+            DEFAULT_INPUT_COST_PER_MILLION,
+            DEFAULT_OUTPUT_COST_PER_MILLION,
+            DEFAULT_CACHE_CREATION_COST_PER_MILLION,
+            DEFAULT_CACHE_READ_COST_PER_MILLION,
+        )
+    }
+
+    const fn from_rates([input, output, cache_creation, cache_read]: [f64; 4]) -> Self {
+        Self::per_million(input, output, cache_creation, cache_read)
+    }
+
+    const fn per_million(input: f64, output: f64, cache_creation: f64, cache_read: f64) -> Self {
         Self {
-            input_cost_per_million: DEFAULT_INPUT_COST_PER_MILLION,
-            output_cost_per_million: DEFAULT_OUTPUT_COST_PER_MILLION,
-            cache_creation_cost_per_million: DEFAULT_CACHE_CREATION_COST_PER_MILLION,
-            cache_read_cost_per_million: DEFAULT_CACHE_READ_COST_PER_MILLION,
+            input_cost_per_million: input,
+            output_cost_per_million: output,
+            cache_creation_cost_per_million: cache_creation,
+            cache_read_cost_per_million: cache_read,
         }
     }
 }
@@ -55,29 +68,219 @@ impl UsageCostEstimate {
 }
 
 /// Returns pricing metadata for a known model alias or family.
+///
+/// Anthropic rates follow <https://platform.claude.com/docs/en/about-claude/pricing>, using
+/// 5-minute cache writes. Unversioned ids fall back to the tier the bare alias resolves to.
 #[must_use]
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     let normalized = model.to_ascii_lowercase();
+    if normalized.contains("fable") || normalized.contains("mythos") {
+        let version =
+            family_version(&normalized, "fable").or_else(|| family_version(&normalized, "mythos"));
+        return Some(match version {
+            Some((5, 1)) => ModelPricing::per_million(10.0, 50.0, 12.5, 0.25),
+            _ => ModelPricing::per_million(10.0, 50.0, 12.5, 1.0),
+        });
+    }
     if normalized.contains("haiku") {
-        return Some(ModelPricing {
-            input_cost_per_million: 1.0,
-            output_cost_per_million: 5.0,
-            cache_creation_cost_per_million: 1.25,
-            cache_read_cost_per_million: 0.1,
+        if normalized.contains("3-5-haiku") {
+            return Some(ModelPricing::per_million(0.8, 4.0, 1.0, 0.08));
+        }
+        return Some(match family_version(&normalized, "haiku") {
+            // Haiku 5.5 bills prompts over 100K tokens at 5x; aggregated usage uses the
+            // base tier, and `pricing_for_request` applies the higher one per request.
+            Some((5, 5)) => ModelPricing::per_million(0.1, 0.5, 0.125, 0.01),
+            _ => ModelPricing::per_million(1.0, 5.0, 1.25, 0.1),
         });
     }
     if normalized.contains("opus") {
-        return Some(ModelPricing {
-            input_cost_per_million: 15.0,
-            output_cost_per_million: 75.0,
-            cache_creation_cost_per_million: 18.75,
-            cache_read_cost_per_million: 1.5,
+        return Some(match family_version(&normalized, "opus") {
+            Some((5, 5)) => ModelPricing::per_million(4.0, 20.0, 5.0, 0.2),
+            // Opus 4/4.1 remain on Bedrock and Google Cloud at the original tier.
+            Some((4, 0 | 1)) => ModelPricing::per_million(15.0, 75.0, 18.75, 1.5),
+            _ => ModelPricing::per_million(5.0, 25.0, 6.25, 0.5),
         });
     }
     if normalized.contains("sonnet") {
-        return Some(ModelPricing::default_sonnet_tier());
+        return Some(match family_version(&normalized, "sonnet") {
+            Some((5, 5)) => ModelPricing::per_million(2.0, 10.0, 2.5, 0.1),
+            Some((5, 0)) => ModelPricing::per_million(2.0, 10.0, 2.5, 0.2),
+            _ => ModelPricing::default_sonnet_tier(),
+        });
     }
-    None
+    // DeepSeek API peak rates (<https://api-docs.deepseek.com/quick_start/pricing>);
+    // off-peak usage is billed at half. Cache misses are billed as regular input,
+    // with no separate cache-write charge. The retired `deepseek-chat` and
+    // `deepseek-reasoner` ids were served by V4 Flash.
+    if normalized.contains("deepseek-v4-pro") {
+        return Some(ModelPricing::per_million(1.32, 3.96, 1.32, 0.044));
+    }
+    if [
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek-chat",
+        "deepseek-reasoner",
+    ]
+    .iter()
+    .any(|id| normalized.contains(id))
+    {
+        return Some(ModelPricing::per_million(0.3, 1.2, 0.3, 0.006));
+    }
+    openai_compatible_pricing(&normalized)
+}
+
+/// xAI bills slugs retired on 2026-05-15 at grok-4.3 rates
+/// (<https://docs.x.ai/developers/migration/may-15-retirement>).
+const GROK_4_3: [f64; 4] = [1.25, 2.5, 1.25, 0.2];
+const GROK_BUILD: [f64; 4] = [1.0, 2.0, 1.0, 0.2];
+
+/// Input, output, cache-write and cache-read rates per MTok for models served through
+/// OpenAI-compatible providers, keyed by model id.
+///
+/// An id also matches its dated snapshots and `-latest` alias (e.g. `gpt-4.1-2025-04-14`),
+/// so a specific snapshot must precede its base id. Long-context tiers live in
+/// [`LONG_CONTEXT_PRICING`]. Cache writes without a separate charge, and models without a
+/// cached-input discount, use the input rate.
+const OPENAI_COMPATIBLE_PRICING: &[(&str, [f64; 4])] = &[
+    // OpenAI standard tier (<https://developers.openai.com/api/docs/pricing>).
+    ("gpt-6-astra", [10.0, 50.0, 12.5, 1.0]),
+    ("gpt-6.1-sol", [2.0, 10.0, 2.5, 0.1]),
+    ("gpt-6-sol", [2.0, 10.0, 2.5, 0.2]),
+    ("gpt-6-luna", [0.1, 0.5, 0.125, 0.01]),
+    ("gpt-5.6-sol", [4.0, 20.0, 5.0, 0.4]),
+    ("gpt-5.6-terra", [2.0, 12.0, 2.5, 0.2]),
+    ("gpt-5.6-luna", [0.2, 1.2, 0.25, 0.02]),
+    ("gpt-5.5", [5.0, 30.0, 5.0, 0.5]),
+    ("gpt-5.5-pro", [30.0, 180.0, 30.0, 30.0]),
+    ("gpt-5.4", [2.5, 15.0, 2.5, 0.25]),
+    ("gpt-5.4-pro", [30.0, 180.0, 30.0, 30.0]),
+    ("gpt-5.4-mini", [0.75, 4.5, 0.75, 0.075]),
+    ("gpt-5.4-nano", [0.2, 1.25, 0.2, 0.02]),
+    ("gpt-5.3-codex", [1.75, 14.0, 1.75, 0.175]),
+    ("gpt-5.2", [1.75, 14.0, 1.75, 0.175]),
+    ("gpt-5.2-pro", [21.0, 168.0, 21.0, 21.0]),
+    ("gpt-5.1", [1.25, 10.0, 1.25, 0.125]),
+    ("gpt-5", [1.25, 10.0, 1.25, 0.125]),
+    ("gpt-5-mini", [0.25, 2.0, 0.25, 0.025]),
+    ("gpt-5-nano", [0.05, 0.4, 0.05, 0.005]),
+    ("gpt-5-pro", [15.0, 120.0, 15.0, 15.0]),
+    ("gpt-4.1", [2.0, 8.0, 2.0, 0.5]),
+    ("gpt-4.1-mini", [0.4, 1.6, 0.4, 0.1]),
+    ("gpt-4.1-nano", [0.1, 0.4, 0.1, 0.025]),
+    ("gpt-4o-2024-05-13", [5.0, 15.0, 5.0, 5.0]),
+    ("gpt-4o", [2.5, 10.0, 2.5, 1.25]),
+    ("gpt-4o-mini", [0.15, 0.6, 0.15, 0.075]),
+    ("o1", [15.0, 60.0, 15.0, 7.5]),
+    ("o1-pro", [150.0, 600.0, 150.0, 150.0]),
+    ("o3", [2.0, 8.0, 2.0, 0.5]),
+    ("o3-pro", [20.0, 80.0, 20.0, 20.0]),
+    ("o3-mini", [1.1, 4.4, 1.1, 0.55]),
+    ("o4-mini", [1.1, 4.4, 1.1, 0.275]),
+    // Google Gemini API paid tier (<https://ai.google.dev/gemini-api/docs/pricing>),
+    // reachable through its OpenAI-compatible endpoint and gateways. Context caching
+    // bills storage per hour rather than a write premium, so writes use the input rate.
+    ("gemini-4-argon", [2.0, 10.0, 2.0, 0.1]),
+    ("gemini-3.8-flash", [0.75, 3.75, 0.75, 0.075]),
+    ("gemini-3.6-flash", [0.75, 3.75, 0.75, 0.075]),
+    ("gemini-3.5-flash-lite", [0.3, 2.5, 0.3, 0.03]),
+    ("gemini-3.1-flash-lite", [0.25, 1.5, 0.25, 0.025]),
+    ("gemini-3.1-pro-preview", [2.0, 12.0, 2.0, 0.2]),
+    ("gemini-3-flash-preview", [0.5, 3.0, 0.5, 0.05]),
+    ("gemini-2.5-pro", [1.25, 10.0, 1.25, 0.125]),
+    ("gemini-2.5-flash", [0.3, 2.5, 0.3, 0.03]),
+    ("gemini-2.5-flash-lite", [0.1, 0.4, 0.1, 0.01]),
+    // xAI (<https://docs.x.ai/docs/models>).
+    ("grok-4.7", [2.0, 6.0, 2.0, 0.5]),
+    ("grok-4.6", [2.0, 6.0, 2.0, 0.5]),
+    ("grok-4.5", [2.0, 6.0, 2.0, 0.3]),
+    ("grok-4.3", GROK_4_3),
+    ("grok-4.20", GROK_4_3),
+    ("grok-4.20-reasoning", GROK_4_3),
+    ("grok-4.20-non-reasoning", GROK_4_3),
+    ("grok-4.20-multi-agent", GROK_4_3),
+    ("grok-build", GROK_BUILD),
+    ("grok-code-fast", GROK_BUILD),
+    ("grok-4", GROK_4_3),
+    ("grok-4-fast-reasoning", GROK_4_3),
+    ("grok-4-fast-non-reasoning", GROK_4_3),
+    ("grok-3", GROK_4_3),
+    // Alibaba Model Studio, China (Beijing) region, which is claw's default DashScope
+    // endpoint (<https://www.alibabacloud.com/help/en/model-studio/model-pricing>).
+    // Non-thinking output; implicit cache hits bill at 20% of input.
+    ("qwen-max", [0.345, 1.377, 0.345, 0.069]),
+    ("qwen-plus", [0.115, 0.287, 0.115, 0.023]),
+    ("qwen-flash", [0.022, 0.216, 0.022, 0.0044]),
+    ("kimi-k2.5", [0.574, 3.011, 0.574, 0.1148]),
+];
+
+/// Rates that replace the base tier once a single request's prompt (input plus cache
+/// reads and writes) exceeds the threshold, keyed like [`OPENAI_COMPATIBLE_PRICING`].
+const LONG_CONTEXT_PRICING: &[(&str, (u32, [f64; 4]))] = &[
+    ("gpt-6-astra", (272_000, [20.0, 75.0, 25.0, 2.0])),
+    ("gpt-6.1-sol", (272_000, [4.0, 15.0, 5.0, 0.2])),
+    ("gpt-6-sol", (272_000, [4.0, 15.0, 5.0, 0.4])),
+    ("gpt-6-luna", (272_000, [0.2, 0.75, 0.25, 0.02])),
+    ("gpt-5.6-sol", (272_000, [8.0, 30.0, 10.0, 0.8])),
+    ("gpt-5.6-terra", (272_000, [4.0, 18.0, 5.0, 0.4])),
+    ("gpt-5.6-luna", (272_000, [0.4, 1.8, 0.5, 0.04])),
+    ("gpt-5.5", (272_000, [10.0, 45.0, 10.0, 1.0])),
+    ("gpt-5.5-pro", (272_000, [60.0, 270.0, 60.0, 60.0])),
+    ("gpt-5.4", (272_000, [5.0, 22.5, 5.0, 0.5])),
+    ("gpt-5.4-pro", (272_000, [60.0, 270.0, 60.0, 60.0])),
+    ("gemini-3.1-pro-preview", (200_000, [4.0, 18.0, 4.0, 0.4])),
+    ("gemini-2.5-pro", (200_000, [2.5, 15.0, 2.5, 0.25])),
+];
+
+const HAIKU_5_5_LONG_CONTEXT: (u32, [f64; 4]) = (100_000, [0.5, 2.5, 0.625, 0.05]);
+
+/// Returns pricing for a single request whose prompt (input plus cache reads and writes)
+/// is `prompt_tokens` long, applying the long-context tiers that [`pricing_for_model`]
+/// leaves out because it also prices usage aggregated across requests.
+#[must_use]
+pub fn pricing_for_request(model: &str, prompt_tokens: u32) -> Option<ModelPricing> {
+    let normalized = model.to_ascii_lowercase();
+    let long_context = if family_version(&normalized, "haiku") == Some((5, 5)) {
+        Some(HAIKU_5_5_LONG_CONTEXT)
+    } else {
+        find_model(LONG_CONTEXT_PRICING, &normalized)
+    };
+    match long_context {
+        Some((threshold, rates)) if prompt_tokens > threshold => {
+            Some(ModelPricing::from_rates(rates))
+        }
+        _ => pricing_for_model(model),
+    }
+}
+
+fn openai_compatible_pricing(normalized: &str) -> Option<ModelPricing> {
+    find_model(OPENAI_COMPATIBLE_PRICING, normalized).map(ModelPricing::from_rates)
+}
+
+fn find_model<T: Copy>(table: &[(&str, T)], normalized: &str) -> Option<T> {
+    let id = normalized.rsplit_once('/').map_or(normalized, |(_, id)| id);
+    table
+        .iter()
+        .find(|(model, _)| {
+            id.strip_prefix(model).is_some_and(|rest| {
+                rest.is_empty()
+                    || rest.strip_prefix('-').is_some_and(|suffix| {
+                        suffix == "latest" || suffix.starts_with(|c: char| c.is_ascii_digit())
+                    })
+            })
+        })
+        .map(|&(_, value)| value)
+}
+
+/// Parses the `(major, minor)` version after `family` in ids such as
+/// `claude-opus-4-1-20250805`, `anthropic/claude-sonnet-5-5`, or `claude-opus-4@20250514`.
+/// Date suffixes are not treated as a minor version.
+fn family_version(model: &str, family: &str) -> Option<(u32, u32)> {
+    let rest = model[model.find(family)? + family.len()..].strip_prefix('-')?;
+    let mut parts = rest.split(|c: char| !c.is_ascii_digit());
+    let parse = |part: &str| part.parse::<u32>().ok().filter(|_| part.len() <= 2);
+    let major = parse(parts.next()?)?;
+    let minor = parts.next().and_then(parse).unwrap_or(0);
+    Some((major, minor))
 }
 
 impl TokenUsage {
@@ -216,7 +419,7 @@ impl UsageTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
+    use super::{format_usd, pricing_for_model, pricing_for_request, TokenUsage, UsageTracker};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
     #[test]
@@ -253,12 +456,12 @@ mod tests {
         };
 
         let cost = usage.estimate_cost_usd();
-        assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
-        assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
+        assert_eq!(format_usd(cost.input_cost_usd), "$3.0000");
+        assert_eq!(format_usd(cost.output_cost_usd), "$7.5000");
         let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-20250514"));
-        assert!(lines[0].contains("estimated_cost=$54.6750"));
+        assert!(lines[0].contains("estimated_cost=$10.9350"));
         assert!(lines[0].contains("model=claude-sonnet-4-20250514"));
-        assert!(lines[1].contains("cache_read=$0.3000"));
+        assert!(lines[1].contains("cache_read=$0.0600"));
     }
 
     #[test]
@@ -269,13 +472,146 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
+        let total_for = |model: &str| {
+            let pricing = pricing_for_model(model).expect("known model pricing");
+            format_usd(
+                usage
+                    .estimate_cost_usd_with_pricing(pricing)
+                    .total_cost_usd(),
+            )
+        };
 
-        let haiku = pricing_for_model("claude-haiku-4-5-20251001").expect("haiku pricing");
-        let opus = pricing_for_model("claude-opus-4-6").expect("opus pricing");
-        let haiku_cost = usage.estimate_cost_usd_with_pricing(haiku);
-        let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
-        assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
-        assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
+        assert_eq!(total_for("claude-fable-5-1"), "$35.0000");
+        assert_eq!(total_for("claude-opus-4-6"), "$17.5000");
+        assert_eq!(total_for("anthropic/claude-opus-5-5"), "$14.0000");
+        assert_eq!(total_for("claude-opus-4-1-20250805"), "$52.5000");
+        assert_eq!(total_for("claude-opus-4@20250514"), "$52.5000");
+        assert_eq!(total_for("claude-sonnet-5-5"), "$7.0000");
+        assert_eq!(total_for("claude-sonnet-4-6"), "$10.5000");
+        assert_eq!(total_for("claude-haiku-5-5"), "$0.3500");
+        assert_eq!(total_for("claude-haiku-4-5-20251001"), "$3.5000");
+        assert_eq!(total_for("claude-3-5-haiku-20241022"), "$2.8000");
+    }
+
+    #[test]
+    fn distinguishes_cache_read_rates_across_versions() {
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1_000_000,
+        };
+        let cache_read_for = |model: &str| {
+            let pricing = pricing_for_model(model).expect("known model pricing");
+            format_usd(
+                usage
+                    .estimate_cost_usd_with_pricing(pricing)
+                    .cache_read_cost_usd,
+            )
+        };
+
+        assert_eq!(cache_read_for("claude-fable-5-1"), "$0.2500");
+        assert_eq!(cache_read_for("claude-fable-5"), "$1.0000");
+        assert_eq!(cache_read_for("claude-sonnet-5-5"), "$0.1000");
+        assert_eq!(cache_read_for("claude-sonnet-5"), "$0.2000");
+    }
+
+    #[test]
+    fn prices_deepseek_api_models_at_peak_rates() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1_000_000,
+        };
+        let total_for = |model: &str| {
+            let pricing = pricing_for_model(model).expect("known model pricing");
+            format_usd(
+                usage
+                    .estimate_cost_usd_with_pricing(pricing)
+                    .total_cost_usd(),
+            )
+        };
+
+        assert_eq!(total_for("deepseek-v4-pro"), "$3.3440");
+        assert_eq!(total_for("openai/deepseek-v4-pro"), "$3.3440");
+        assert_eq!(total_for("deepseek-flash"), "$0.9060");
+        assert_eq!(total_for("deepseek/deepseek-v4-flash"), "$0.9060");
+        assert_eq!(total_for("deepseek-reasoner"), "$0.9060");
+        // Third-party hosts set their own prices for other DeepSeek models.
+        assert_eq!(pricing_for_model("deepseek-r1"), None);
+    }
+
+    #[test]
+    fn prices_openai_compatible_provider_models() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 500_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 1_000_000,
+        };
+        let total_for = |model: &str| {
+            let pricing = pricing_for_model(model).expect("known model pricing");
+            format_usd(
+                usage
+                    .estimate_cost_usd_with_pricing(pricing)
+                    .total_cost_usd(),
+            )
+        };
+
+        assert_eq!(total_for("gpt-5.4-mini"), "$3.0750");
+        assert_eq!(total_for("openai/gpt-4.1-2025-04-14"), "$6.5000");
+        assert_eq!(total_for("gpt-4o-2024-08-06"), "$8.7500");
+        assert_eq!(total_for("gpt-4o-2024-05-13"), "$17.5000");
+        assert_eq!(total_for("o3-mini"), "$3.8500");
+        assert_eq!(total_for("grok-4.3"), "$2.7000");
+        // Retired xAI slugs are billed as grok-4.3.
+        assert_eq!(total_for("grok-3"), "$2.7000");
+        assert_eq!(total_for("grok-4-1-fast-reasoning"), "$2.7000");
+        assert_eq!(total_for("grok-code-fast-1"), "$2.2000");
+        assert_eq!(total_for("qwen/qwen-max"), "$1.1025");
+        assert_eq!(total_for("qwen-plus-latest"), "$0.2815");
+        assert_eq!(total_for("kimi-k2.5"), "$2.1943");
+        assert_eq!(total_for("gpt-5.5-pro"), "$150.0000");
+        assert_eq!(total_for("gpt-5.3-codex"), "$8.9250");
+        assert_eq!(total_for("o3-pro-2025-06-10"), "$80.0000");
+        assert_eq!(total_for("o3"), "$6.5000");
+        assert_eq!(total_for("google/gemini-2.5-pro"), "$6.3750");
+        assert_eq!(total_for("gemini-2.5-flash-lite"), "$0.3100");
+        assert_eq!(total_for("gemini-3.1-pro-preview"), "$8.2000");
+        for unpriced in [
+            "o1-mini",
+            "grok-3-mini",
+            "qwen-turbo",
+            "qwen-plus-character",
+        ] {
+            assert_eq!(pricing_for_model(unpriced), None, "{unpriced}");
+        }
+    }
+
+    #[test]
+    fn applies_long_context_tiers_per_request() {
+        let rates = |model: &str, prompt_tokens: u32| {
+            let pricing = pricing_for_request(model, prompt_tokens).expect("known model pricing");
+            (
+                pricing.input_cost_per_million,
+                pricing.output_cost_per_million,
+            )
+        };
+
+        assert_eq!(rates("claude-haiku-5-5", 100_000), (0.1, 0.5));
+        assert_eq!(rates("claude-haiku-5-5-20260301", 100_001), (0.5, 2.5));
+        assert_eq!(rates("claude-haiku-4-5", 500_000), (1.0, 5.0));
+        assert_eq!(rates("gpt-5.4", 272_000), (2.5, 15.0));
+        assert_eq!(rates("openai/gpt-5.4", 272_001), (5.0, 22.5));
+        assert_eq!(rates("gpt-5.4-mini", 900_000), (0.75, 4.5));
+        assert_eq!(rates("gemini-2.5-pro", 200_001), (2.5, 15.0));
+        assert_eq!(rates("claude-sonnet-4-6", 900_000), (3.0, 15.0));
+        assert_eq!(
+            pricing_for_request("gpt-5.5", 1_000),
+            pricing_for_model("gpt-5.5")
+        );
+        assert_eq!(pricing_for_request("custom-model", 1_000_000), None);
     }
 
     #[test]

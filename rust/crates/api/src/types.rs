@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
+use runtime::{pricing_for_request, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -213,7 +213,9 @@ impl Usage {
     #[must_use]
     pub fn estimated_cost_usd(&self, model: &str) -> UsageCostEstimate {
         let usage = self.token_usage();
-        pricing_for_model(model).map_or_else(
+        let prompt_tokens =
+            self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens;
+        pricing_for_request(model, prompt_tokens).map_or_else(
             || usage.estimate_cost_usd(),
             |pricing| usage.estimate_cost_usd_with_pricing(pricing),
         )
@@ -320,7 +322,7 @@ mod tests {
         };
 
         let cost = response.usage.estimated_cost_usd(&response.model);
-        assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
+        assert_eq!(format_usd(cost.total_cost_usd()), "$10.9350");
         assert_eq!(response.total_tokens(), 1_800_000);
     }
 
