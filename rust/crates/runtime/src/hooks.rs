@@ -742,8 +742,13 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let command_builder = {
+        use std::os::windows::process::CommandExt;
+
+        // This is a configured shell command, not a single argv value. cmd
+        // does not understand the C-runtime backslash escaping used by arg().
         let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
+        command_builder.args(["/D", "/S", "/C"]);
+        command_builder.raw_arg(format!("\"{command}\""));
         CommandWithStdin::new(command_builder)
     };
 
@@ -797,7 +802,16 @@ impl CommandWithStdin {
     ) -> std::io::Result<CommandExecution> {
         let mut child = self.command.spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(stdin)?;
+            // A hook that exits without reading all of its stdin closes the pipe
+            // while the payload is still being written, which fails with
+            // `BrokenPipe`. That is not a hook failure: its exit status and
+            // output are still collected below. Same handling as the plugin hook
+            // runner in `plugins/src/hooks.rs`.
+            match child_stdin.write_all(stdin) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Err(error) => return Err(error),
+            }
         }
 
         loop {
@@ -845,7 +859,7 @@ mod tests {
     #[test]
     fn allows_exit_code_zero_and_captures_stdout() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet("printf 'pre ok'")],
+            vec![crate::test_hook("pre ok", "", 0, 0)],
             Vec::new(),
             Vec::new(),
         ));
@@ -856,16 +870,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn hook_that_ignores_stdin_is_not_failed_by_a_payload_larger_than_the_pipe() {
+        // The hook never reads stdin and exits while the runner is still writing
+        // a payload that does not fit in the pipe buffer, so the write fails with
+        // `BrokenPipe`. The hook itself succeeded and must not be reported as failed.
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![crate::test_hook("pre ok", "", 0, 0)],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let tool_input = serde_json::json!({ "content": "x".repeat(70_000) }).to_string();
+
+        let result = runner.run_pre_tool_use("write_file", &tool_input);
+
+        assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
+    }
+
+    #[test]
     fn object_style_hook_matchers_filter_runtime_execution() {
         let runner = HookRunner::new(RuntimeHookConfig::from_hook_commands(
             vec![
-                RuntimeHookCommand::new(shell_snippet("printf 'legacy'")),
+                RuntimeHookCommand::new(crate::test_hook("legacy", "", 0, 0)),
                 RuntimeHookCommand::with_matcher(
-                    shell_snippet("printf 'bash only'"),
+                    crate::test_hook("bash only", "", 0, 0),
                     Some("Bash".to_string()),
                 ),
                 RuntimeHookCommand::with_matcher(
-                    shell_snippet("printf 'read only'"),
+                    crate::test_hook("read only", "", 0, 0),
                     Some("Read*".to_string()),
                 ),
             ],
@@ -889,7 +921,7 @@ mod tests {
     #[test]
     fn denies_exit_code_two() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet("printf 'blocked by hook'; exit 2")],
+            vec![crate::test_hook("blocked by hook", "", 2, 0)],
             Vec::new(),
             Vec::new(),
         ));
@@ -904,7 +936,7 @@ mod tests {
     fn propagates_other_non_zero_statuses_as_failures() {
         let runner = HookRunner::from_feature_config(&RuntimeFeatureConfig::default().with_hooks(
             RuntimeHookConfig::new(
-                vec![shell_snippet("printf 'warning hook'; exit 1")],
+                vec![crate::test_hook("warning hook", "", 1, 0)],
                 Vec::new(),
                 Vec::new(),
             ),
@@ -925,8 +957,11 @@ mod tests {
     #[test]
     fn parses_pre_hook_permission_override_and_updated_input() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet(
-                r#"printf '%s' '{"systemMessage":"updated","hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"hook ok","updatedInput":{"command":"git status"}}}'"#,
+            vec![crate::test_hook(
+                r#"{"systemMessage":"updated","hookSpecificOutput":{"permissionDecision":"allow","permissionDecisionReason":"hook ok","updatedInput":{"command":"git status"}}}"#,
+                "",
+                0,
+                0,
             )],
             Vec::new(),
             Vec::new(),
@@ -949,7 +984,7 @@ mod tests {
         let runner = HookRunner::new(RuntimeHookConfig::new(
             Vec::new(),
             Vec::new(),
-            vec![shell_snippet("printf 'failure hook ran'")],
+            vec![crate::test_hook("failure hook ran", "", 0, 0)],
         ));
 
         // when
@@ -968,8 +1003,8 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![
-                shell_snippet("printf 'broken failure hook'; exit 1"),
-                shell_snippet("printf 'later failure hook'"),
+                crate::test_hook("broken failure hook", "", 1, 0),
+                crate::test_hook("later failure hook", "", 0, 0),
             ],
         ));
 
@@ -994,8 +1029,8 @@ mod tests {
         // given
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![
-                shell_snippet("printf 'first'"),
-                shell_snippet("printf 'second'"),
+                crate::test_hook("first", "", 0, 0),
+                crate::test_hook("second", "", 0, 0),
             ],
             Vec::new(),
             Vec::new(),
@@ -1022,7 +1057,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'first'"
+            } if command == &crate::test_hook("first", "", 0, 0)
         ));
         assert!(matches!(
             &reporter.events[1],
@@ -1030,7 +1065,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'first'"
+            } if command == &crate::test_hook("first", "", 0, 0)
         ));
         assert!(matches!(
             &reporter.events[2],
@@ -1038,7 +1073,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'second'"
+            } if command == &crate::test_hook("second", "", 0, 0)
         ));
         assert!(matches!(
             &reporter.events[3],
@@ -1046,7 +1081,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'second'"
+            } if command == &crate::test_hook("second", "", 0, 0)
         ));
     }
 
@@ -1055,8 +1090,8 @@ mod tests {
         // given
         let runner = HookRunner::new(RuntimeHookConfig::new(
             vec![
-                shell_snippet("printf 'broken'; exit 1"),
-                shell_snippet("printf 'later'"),
+                crate::test_hook("broken", "", 1, 0),
+                crate::test_hook("later", "", 0, 0),
             ],
             Vec::new(),
             Vec::new(),
@@ -1077,8 +1112,11 @@ mod tests {
     #[test]
     fn malformed_nonempty_hook_output_reports_explicit_diagnostic_with_previews() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet(
-                "printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1",
+            vec![crate::test_hook(
+                "{not-json\nsecond line",
+                "stderr warning",
+                1,
+                0,
             )],
             Vec::new(),
             Vec::new(),
@@ -1091,8 +1129,16 @@ mod tests {
         assert!(rendered.contains("hook_invalid_json:"));
         assert!(rendered.contains("phase=PreToolUse"));
         assert!(rendered.contains("tool=Edit"));
-        assert!(rendered.contains("command=printf '{not-json"));
-        assert!(rendered.contains("printf 'stderr warning' >&2; exit 1"));
+        assert!(rendered.contains(&format!(
+            "command={}",
+            super::bounded_hook_preview(&crate::test_hook(
+                "{not-json\nsecond line",
+                "stderr warning",
+                1,
+                0
+            ))
+            .expect("command preview")
+        )));
         assert!(rendered.contains("detail=key must be a string"));
         assert!(rendered.contains("stdout_preview={not-json"));
         assert!(rendered.contains("second line stderr_preview=stderr warning"));
@@ -1102,7 +1148,7 @@ mod tests {
     #[test]
     fn abort_signal_cancels_long_running_hook_and_reports_progress() {
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet("sleep 5")],
+            vec![crate::test_hook("", "", 0, 5)],
             Vec::new(),
             Vec::new(),
         ));
@@ -1137,15 +1183,5 @@ mod tests {
                 ..
             }
         )));
-    }
-
-    #[cfg(windows)]
-    fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
-    }
-
-    #[cfg(not(windows))]
-    fn shell_snippet(script: &str) -> String {
-        script.to_string()
     }
 }

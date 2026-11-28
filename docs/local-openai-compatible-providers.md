@@ -2,7 +2,7 @@
 
 This guide covers two common offline/local workflows:
 
-1. running Claw against an OpenAI-compatible local model server such as Ollama, llama.cpp, or vLLM; and
+1. running Claw against an OpenAI-compatible local model server such as Ollama, LM Studio, llama.cpp, or vLLM; and
 2. installing local skills from disk so Claw can discover them without network access.
 
 ## Claw is not Claude-only
@@ -25,7 +25,8 @@ Routing notes:
 
 - Use the `openai/` prefix for OpenAI-compatible gateways when you need prefix routing to win over ambient Anthropic credentials, for example `--model "openai/gpt-4.1-mini"` with OpenRouter.
 - For local servers, prefer the exact model ID reported by the server (`qwen3:latest`, `llama3.2`, etc.). If your local gateway exposes slash-containing IDs, prefix the exact slug with `local/` so Claw routes through OpenAI-compatible transport while sending the rest verbatim, for example `--model "local/Qwen/Qwen2.5-Coder-7B-Instruct"`.
-- If you have multiple provider keys in your environment, `OPENAI_BASE_URL` plus local-looking tags such as `llama3.2` or `qwen2.5-coder:7b` selects the local OpenAI-compatible route; use `local/` for slash-containing local IDs.
+- When `OPENAI_BASE_URL` points at a loopback or private-network address (`localhost`, `127.0.0.1`, `10.x`, `192.168.x`, `172.16-31.x`), Claw accepts **any** non-empty model name — bare aliases like `mistral` work with no dot, colon, or slash required. This covers LM Studio and llama.cpp server setups that register models under a plain `--alias`, not just Ollama-style tagged names (`llama3.2`, `qwen2.5-coder:7b`). `local/` is still needed only to preserve slash-containing IDs verbatim (e.g. Hugging Face repo IDs for vLLM/mlx-lm).
+- Against a remote/hosted OpenAI-compatible gateway (not local/private), Claw keeps the stricter `provider/model` or dot/colon-tag requirement so a mistyped bare name doesn't silently route to a paid hosted API.
 - Tool workflows need model/server support for OpenAI-compatible tool calls. Plain prompt smoke tests can pass even when slash/tool workflows still fail because the server returns an incompatible tool-call shape.
 
 ## Raw `/v1/chat/completions` smoke test
@@ -81,6 +82,17 @@ export OPENAI_API_KEY="local-dev-token"
 claw --model "qwen2.5-coder" prompt "Reply exactly HELLO_WORLD_123"
 ```
 
+## LM Studio
+
+Start LM Studio's local server (Developer tab → Start Server, default port `1234`), or headless via `lms server start`. LM Studio commonly serves models under a bare alias with no dot or colon (for example `mistral-7b-instruct` or a custom name set in the model settings).
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:1234/v1"
+claw --model "mistral-7b-instruct" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+`OPENAI_API_KEY` can stay unset for LM Studio's default authless local server. Use the exact model identifier LM Studio reports (check `curl $OPENAI_BASE_URL/models`) if the bare alias above doesn't match what you loaded.
+
 ## vLLM or another OpenAI-compatible server
 
 Start vLLM with an OpenAI-compatible API server:
@@ -117,6 +129,254 @@ claw --model "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit" prompt "Reply exactl
 ```
 
 mlx-lm serves models under their full Hugging Face repo ID. Use the exact `id` field from `curl $OPENAI_BASE_URL/models` for `--model`. A bare name like `qwen2.5-coder-7b-instruct` will fail model resolution before the request ever reaches the server.
+
+## OmniRoute and other remote OpenAI-compatible gateways
+
+[OmniRoute](https://github.com/diegosouzapw/OmniRoute) is a third-party OpenAI-compatible AI gateway that can route requests to multiple providers. To use any remote OpenAI-compatible gateway with Claw, set `OPENAI_BASE_URL` to the gateway's `/v1` endpoint and provide your API key:
+
+```bash
+export OPENAI_BASE_URL="https://api.omniroute.ai/v1"
+export OPENAI_API_KEY="your-omniroute-api-key"
+claw --model "gpt-4" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+To find the available model IDs on your gateway, use the `/models` endpoint:
+
+```bash
+curl -sS "$OPENAI_BASE_URL/models" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | jq '.data[].id'
+```
+
+For local configuration, see your gateway's documentation for the correct base URL, API key format, and available model IDs. The same OPENAI_BASE_URL + OPENAI_API_KEY pattern applies to any OpenAI-compatible remote gateway.
+
+## LLMTR
+
+[LLMTR](https://llmtr.com) is an OpenAI-compatible gateway. Use the same client: set `OPENAI_BASE_URL` to `https://llmtr.com/v1` and `OPENAI_API_KEY` to a bearer key (`llmtr-...`).
+
+```bash
+export OPENAI_BASE_URL="https://llmtr.com/v1"
+export OPENAI_API_KEY="llmtr-..."
+claw --model "local/llmtr/qwen3-8-27b" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+Send the catalog id unchanged. `llmtr/qwen3-8-27b` already starts with the gateway name, so that prefix stays on the wire. The `local/` hatch only selects the OpenAI-compatible transport and is removed before the request. A bare `qwen/` or `qwen-` name is a DashScope route and will not reach LLMTR, so vendor-prefixed ids need the same hatch: `local/<vendor>/<model>`.
+
+Claw asks for up to 64,000 output tokens on these routes. LLMTR rejects a request whose `max_tokens` is above the model's output limit, so pick a model that allows at least that much. `llmtr/qwen3-8-27b` allows 262,144. Each model's limit is listed as `top_provider.max_completion_tokens` in the catalog below.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://llmtr.com/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.top_provider.max_completion_tokens)"'
+```
+
+## MartLLM
+
+[MartLLM](https://martllm.com) is a pay-as-you-go OpenAI-compatible gateway (prepaid, no free tier). Set `OPENAI_BASE_URL` to `https://api.martllm.com/v1` and `OPENAI_API_KEY` to a bearer key (`ull_...`).
+
+```bash
+export OPENAI_BASE_URL="https://api.martllm.com/v1"
+export OPENAI_API_KEY="ull_..."
+claw --model "local/deepseek/deepseek-v4-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+MartLLM ids are vendor-prefixed (`deepseek/deepseek-v4-flash`, `moonshotai/kimi-k2.6`, `qwen/qwen3.8-flash`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Some prefixes would otherwise pick a native route; a bare `qwen/qwen3.8-flash`, for example, goes to DashScope and asks for `DASHSCOPE_API_KEY`.
+
+Claw asks for up to 64,000 output tokens on these routes. MartLLM does not reject that on a model with a smaller output limit (for example `aion-labs/aion-3-0-mini`, 32,768); the answer is simply bounded by the model's limit, listed as `max_output_tokens` in the catalog below.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://api.martllm.com/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.max_output_tokens)"'
+```
+
+## Standard Compute
+
+[Standard Compute](https://standardcompute.com) is an OpenAI-compatible gateway. Set `OPENAI_BASE_URL` to `https://api.stdcmpt.com/v1` and `OPENAI_API_KEY` to your Standard Compute key.
+
+```bash
+export STANDARDCOMPUTE_API_KEY="your-standardcompute-api-key"
+export OPENAI_BASE_URL="https://api.stdcmpt.com/v1"
+export OPENAI_API_KEY="$STANDARDCOMPUTE_API_KEY"
+claw --model "local/StandardCompute" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+`StandardCompute` is the routed model: the router picks from the models enabled on your account using your quality preference, so harder tasks go to stronger models and simpler ones to cheaper models ([routing docs](https://docs.standardcompute.com/models#smart-routing)). It is a bare name on a remote gateway, so it needs the `local/` hatch, which selects the OpenAI-compatible transport and is removed before the request.
+
+To pin one model, use a vendor-prefixed id from the catalog with the same hatch, for example `--model "local/deepseek/deepseek-v4-flash"`. A bare vendor prefix can pick a native route instead of the gateway.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://api.stdcmpt.com/v1/models" | jq -r '.data[].id'
+```
+
+See the [Standard Compute docs](https://docs.standardcompute.com) for keys and account setup.
+
+## HopBase
+
+[HopBase](https://hop-base.com) is an OpenAI-compatible API for Claude, GPT, GLM, DeepSeek, Qwen, and other model families. Set `OPENAI_BASE_URL` to `https://api.hop-base.com/v1` and `OPENAI_API_KEY` to your HopBase key.
+
+```bash
+export HOPBASE_API_KEY="your-hopbase-api-key"
+export OPENAI_BASE_URL="https://api.hop-base.com/v1"
+export OPENAI_API_KEY="$HOPBASE_API_KEY"
+claw --model "local/glm-5.3-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+HopBase ids are bare names without a vendor prefix (`glm-5.3-flash`, `gpt-5.6-luna`, `claude-sonnet-5-5`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the id goes out unchanged. Without it, a bare `claude-` id picks the native Anthropic route, and a bare `qwen-` or `kimi-` id goes to DashScope.
+
+The model list needs your key and shows the ids that key can call:
+
+```bash
+curl -sS "https://api.hop-base.com/v1/models" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | jq -r '.data[].id'
+```
+
+See the [HopBase docs](https://hop-base.com/en/docs) for keys and account setup.
+
+## Requesty
+
+[Requesty](https://www.requesty.ai) is an OpenAI-compatible gateway that routes to first-party providers such as OpenAI, Anthropic, and Google. Set `OPENAI_BASE_URL` to `https://router.requesty.ai/v1` (or `https://router.eu.requesty.ai/v1` for the EU endpoint) and `OPENAI_API_KEY` to your Requesty key.
+
+```bash
+export REQUESTY_API_KEY="your-requesty-api-key"
+export OPENAI_BASE_URL="https://router.requesty.ai/v1"
+export OPENAI_API_KEY="$REQUESTY_API_KEY"
+claw --model "local/anthropic/claude-sonnet-5-5" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+Requesty ids are vendor-prefixed (`openai/gpt-4o-mini`, `anthropic/claude-sonnet-5-5`, `google/gemini-3.6-flash`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Without it, an `anthropic/` id picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`.
+
+Requesty also serves the Anthropic Messages API, so the native route works as well: set `ANTHROPIC_BASE_URL` to `https://router.requesty.ai` (no `/v1`) and `ANTHROPIC_API_KEY` to the same key, then run `--model "anthropic/claude-sonnet-5-5"`.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://router.requesty.ai/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.max_output_tokens)"'
+```
+
+See the [Requesty docs](https://docs.requesty.ai) for keys and account setup.
+
+## WorldRouter
+
+[WorldRouter](https://www.worldrouter.ai) is an OpenAI-compatible gateway for Claude, GPT, Gemini, DeepSeek, Kimi, and GLM models. Set `OPENAI_BASE_URL` to `https://inference-api.worldrouter.ai/v1` and `OPENAI_API_KEY` to your WorldRouter key.
+
+```bash
+export WORLDROUTER_API_KEY="your-worldrouter-api-key"
+export OPENAI_BASE_URL="https://inference-api.worldrouter.ai/v1"
+export OPENAI_API_KEY="$WORLDROUTER_API_KEY"
+claw --model "local/deepseek-v4-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+WorldRouter ids are bare names without a vendor prefix (`deepseek-v4-flash`, `gpt-5.4`, `claude-sonnet-5-5`, `gemini-4-neon`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the id goes out unchanged. Without it, a bare `claude-` id picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`.
+
+WorldRouter also serves the Anthropic Messages API, so the native route works as well: set `ANTHROPIC_BASE_URL` to `https://inference-api.worldrouter.ai` (no `/v1`) and `ANTHROPIC_API_KEY` to the same key, then run `--model "claude-sonnet-5-5"`.
+
+The model list needs your key and shows the ids that key can call:
+
+```bash
+curl -sS "https://inference-api.worldrouter.ai/v1/models" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | jq -r '.data[].id'
+```
+
+See the [WorldRouter quickstart](https://www.worldrouter.ai/docs/quickstart) for keys and account setup.
+
+## onomeo
+
+[onomeo](https://onomeo.com) is an OpenAI-compatible gateway for Claude, GPT, Gemini and DeepSeek models. Set `OPENAI_BASE_URL` to `https://onomeo.com/v1` and `OPENAI_API_KEY` to your onomeo key.
+
+```bash
+export ONOMEO_API_KEY="your-onomeo-api-key"
+export OPENAI_BASE_URL="https://onomeo.com/v1"
+export OPENAI_API_KEY="$ONOMEO_API_KEY"
+claw --model "local/deepseek-v4.1-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+onomeo ids are bare names without a vendor prefix (`deepseek-v4.1-flash`, `claude-sonnet-5.5`, `gpt-6.2-sol`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the id goes out unchanged. Without it, a bare `claude-` id picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`.
+
+onomeo also serves the Anthropic Messages API, so the native route works as well: set `ANTHROPIC_BASE_URL` to `https://onomeo.com` (no `/v1`) and `ANTHROPIC_API_KEY` to the same key, then run `--model "claude-sonnet-5.5"`.
+
+The model list needs your key and shows the ids that key can call:
+
+```bash
+curl -sS "https://onomeo.com/v1/models" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" | jq -r '.data[].id'
+```
+
+See the [onomeo integration guides](https://onomeo.com/integrations) for keys and account setup.
+
+## Straitly
+
+[Straitly](https://straitly.ai) is an AI gateway with one OpenAI-compatible API key for 150+ models, including Claude, GPT, Gemini, Grok and DeepSeek. Set `OPENAI_BASE_URL` to `https://api.straitly.ai/v1` and `OPENAI_API_KEY` to your Straitly key.
+
+```bash
+export STRAITLY_API_KEY="your-straitly-api-key"
+export OPENAI_BASE_URL="https://api.straitly.ai/v1"
+export OPENAI_API_KEY="$STRAITLY_API_KEY"
+claw --model "local/deepseek/deepseek-v4-1-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+Straitly ids are vendor-prefixed (`owner/model`, such as `deepseek/deepseek-v4-1-flash`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Without it, an id that starts with `anthropic/` picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`.
+
+Claw asks for up to 64,000 output tokens on these routes, so pick a model whose output limit is at least that. `deepseek/deepseek-v4-1-flash` allows 1,048,576. Each model's limit is listed as `top_provider.max_completion_tokens` in the catalog below.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://api.straitly.ai/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.context_length)\t\(.top_provider.max_completion_tokens)"'
+```
+
+See the [Straitly quickstart](https://straitly.ai/docs/quickstart) for keys and account setup.
+
+## TeamoRouter
+
+[TeamoRouter](https://teamorouter.com) is an OpenAI-compatible gateway for GLM, Kimi, DeepSeek, Qwen, Claude, GPT, Gemini and other model families behind one key. Set `OPENAI_BASE_URL` to `https://api.teamorouter.com/v1` and `OPENAI_API_KEY` to your TeamoRouter key.
+
+```bash
+export TEAMOROUTER_API_KEY="your-teamorouter-api-key"
+export OPENAI_BASE_URL="https://api.teamorouter.com/v1"
+export OPENAI_API_KEY="$TEAMOROUTER_API_KEY"
+claw --model "local/glm-5.3" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+TeamoRouter ids are bare names without a vendor prefix (`glm-5.3`, `deepseek-v4-flash`, `claude-sonnet-5-5`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the id goes out unchanged. Without it, a bare `claude-` id picks the native Anthropic route, and a bare `qwen` or `kimi` id goes to DashScope.
+
+Claw asks for up to 64,000 output tokens on these routes. `glm-5.3`, `deepseek-v4-flash` and `claude-sonnet-5-5` accept that; models with a lower cap list it as `max_output_tokens` in the public catalog, which does not need a key:
+
+```bash
+curl -sS "https://api.teamorouter.com/v1/models/pricing" \
+  | jq -r '.models[] | "\(.id)\t\(.context_window)\t\(.max_output_tokens)"'
+```
+
+See the [TeamoRouter docs](https://teamorouter.com/docs) for keys and account setup.
+
+## TrustedRouter
+
+[TrustedRouter](https://trustedrouter.com) is an OpenAI-compatible gateway that routes to Anthropic, OpenAI, Google, DeepSeek and other providers behind one key. Set `OPENAI_BASE_URL` to `https://api.trustedrouter.com/v1` and `OPENAI_API_KEY` to your TrustedRouter key.
+
+```bash
+export TRUSTEDROUTER_API_KEY="your-trustedrouter-api-key"
+export OPENAI_BASE_URL="https://api.trustedrouter.com/v1"
+export OPENAI_API_KEY="$TRUSTEDROUTER_API_KEY"
+claw --model "local/deepseek/deepseek-v4-flash" prompt "Reply exactly HELLO_WORLD_123"
+```
+
+TrustedRouter ids are vendor-prefixed (`deepseek/deepseek-v4-flash`, `anthropic/claude-sonnet-4.5`). Put `local/` in front of every one: the hatch selects the OpenAI-compatible transport and is removed, so the catalog id goes out unchanged. Without it, an `anthropic/` id picks the native Anthropic route and asks for `ANTHROPIC_API_KEY`. The routed model `trustedrouter/auto`, which picks a model per request, takes the same hatch: `--model "local/trustedrouter/auto"`.
+
+Claw asks for up to 64,000 output tokens on these routes, so pick a model whose output limit is at least that. `deepseek/deepseek-v4-flash` allows 393,216. Each model's limit is listed as `top_provider.max_completion_tokens` in the catalog below.
+
+The public model list does not need a key:
+
+```bash
+curl -sS "https://api.trustedrouter.com/v1/models" \
+  | jq -r '.data[] | "\(.id)\t\(.context_length)\t\(.top_provider.max_completion_tokens)"'
+```
+
+See the [TrustedRouter docs](https://trustedrouter.com/docs) for keys and account setup.
 
 ## Local skills install from disk
 

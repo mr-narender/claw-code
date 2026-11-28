@@ -18,6 +18,11 @@
   </a>
 </p>
 
+<p align="center">
+  <strong>English</strong> ·
+  <a href="README.zh.md">中文</a>
+</p>
+
 <h3 align="center">start with the real crab-powered harnesses</h3>
 
 <p align="center">
@@ -80,11 +85,11 @@
 </p>
 
 <p align="center">
-  <a href="https://star-history.com/#ultraworkers/claw-code&Date">
+  <a href="https://star-history.dera.page/#ultraworkers/claw-code&Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
-      <img alt="Star history for ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=ultraworkers/claw-code&type=Date" />
+      <img alt="Star history for ultraworkers/claw-code" src="https://star-history.dera.page/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
     </picture>
   </a>
 </p>
@@ -292,6 +297,10 @@ Claw Code is built in the open alongside the broader UltraWorkers toolchain:
 - [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
 - [gajae-code](https://github.com/Yeachan-Heo/gajae-code)
 - [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
+
+Community integrations:
+
+- [deja-vu](https://github.com/vshulcz/deja-vu) — local BM25 session memory across Claw Code (`~/.claw/sessions/`) and 46 other coding agents
 
 ## Ownership / affiliation disclaimer
 

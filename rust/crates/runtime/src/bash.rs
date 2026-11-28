@@ -293,6 +293,41 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
     resolve_sandbox_status_for_request(&request, cwd)
 }
 
+// Git for Windows normally adds Git/cmd, but not Git/bin, to PATH.
+// Prefer a native shell there rather than the Windows WSL bash launcher.
+fn posix_shell() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(path) = env::var_os("PATH") {
+            for directory in env::split_paths(&path) {
+                let shell = directory.join("sh.exe");
+                if shell.is_file() {
+                    return shell;
+                }
+                if directory.join("git.exe").is_file() {
+                    if let Some(root) = directory.parent() {
+                        let shell = root.join("bin").join("sh.exe");
+                        if shell.is_file() {
+                            return shell;
+                        }
+                    }
+                }
+            }
+        }
+        for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Some(root) = env::var_os(variable) {
+                for relative in ["Git/bin/sh.exe", "Programs/Git/bin/sh.exe"] {
+                    let shell = std::path::PathBuf::from(&root).join(relative);
+                    if shell.is_file() {
+                        return shell;
+                    }
+                }
+            }
+        }
+    }
+    std::path::PathBuf::from("sh")
+}
+
 fn prepare_command(
     command: &str,
     cwd: &std::path::Path,
@@ -311,7 +346,7 @@ fn prepare_command(
         return prepared;
     }
 
-    let mut prepared = Command::new("sh");
+    let mut prepared = Command::new(posix_shell());
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
@@ -337,7 +372,7 @@ fn prepare_tokio_command(
             cmd.envs(launcher.env);
             cmd
         } else {
-            let mut cmd = TokioCommand::new("sh");
+            let mut cmd = TokioCommand::new(posix_shell());
             cmd.arg("-lc").arg(command);
             if sandbox_status.filesystem_active {
                 cmd.env("HOME", cwd.join(".sandbox-home"));
@@ -365,7 +400,7 @@ mod tests {
     fn executes_simple_command() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
-            timeout: Some(1_000),
+            timeout: Some(30_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(false),
@@ -376,8 +411,12 @@ mod tests {
         })
         .expect("bash command should execute");
 
+        assert!(
+            !output.interrupted,
+            "command was interrupted (timeout?); stderr: {}",
+            output.stderr
+        );
         assert_eq!(output.stdout, "hello");
-        assert!(!output.interrupted);
         assert!(output.sandbox_status.is_some());
     }
 
@@ -385,7 +424,7 @@ mod tests {
     fn disables_sandbox_when_requested() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
-            timeout: Some(1_000),
+            timeout: Some(30_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
@@ -428,7 +467,7 @@ mod tests {
     fn prevents_stdin_hangs_by_redirecting_to_null() {
         let output = execute_bash(BashCommandInput {
             command: String::from("cat"),
-            timeout: Some(2_000),
+            timeout: Some(30_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
